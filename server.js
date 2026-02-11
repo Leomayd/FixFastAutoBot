@@ -3,7 +3,7 @@ import crypto from "crypto";
 import { Telegraf, Markup } from "telegraf";
 import pg from "pg";
 
-console.log("SERVER VERSION: 2026-02-12_fixfast_pg_v3_vin_photos");
+console.log("SERVER VERSION: 2026-02-12_fixfast_pg_v4_vin_pexels");
 
 // =============== ENV ===============
 const BOT_TOKEN = (process.env.BOT_TOKEN || "").trim();
@@ -20,10 +20,9 @@ const TOPIC_ID_TUNING = (process.env.TOPIC_ID_TUNING || "").trim();
 
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 
-// VIN + Images
+// VIN + Pexels
 const VIN_API_NINJAS_KEY = (process.env.VIN_API_NINJAS_KEY || "").trim();
-const BING_IMAGE_KEY = (process.env.BING_IMAGE_KEY || "").trim();
-const BING_IMAGE_ENDPOINT = (process.env.BING_IMAGE_ENDPOINT || "https://api.bing.microsoft.com/v7.0/images/search").trim();
+const PEXELS_KEY = (process.env.PEXELS_KEY || "").trim();
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN env is required");
 if (!PUBLIC_URL) throw new Error("PUBLIC_URL env is required");
@@ -106,7 +105,7 @@ async function dbInit() {
     );
   `);
 
-  // add columns if not exists
+  // new columns
   await pool.query(`ALTER TABLE cars ADD COLUMN IF NOT EXISTS vin text NOT NULL DEFAULT '';`);
   await pool.query(`ALTER TABLE cars ADD COLUMN IF NOT EXISTS color text NOT NULL DEFAULT '';`);
 
@@ -151,7 +150,7 @@ async function dbInit() {
       id uuid PRIMARY KEY,
       car_id uuid NOT NULL REFERENCES cars(id) ON DELETE CASCADE,
       url text NOT NULL,
-      source text NOT NULL DEFAULT 'bing',
+      source text NOT NULL DEFAULT 'pexels',
       created_at timestamptz NOT NULL DEFAULT now()
     );
   `);
@@ -333,36 +332,19 @@ async function awardDoneBonusIfNeeded(reqRow) {
   }
 }
 
-// ===== VIN + IMAGE helpers =====
+// ===== VIN + Pexels helpers =====
 function isValidVin(vin) {
   return /^[A-HJ-NPR-Z0-9]{17}$/.test(vin);
 }
 
 async function decodeVin(vin) {
-  if (!VIN_API_NINJAS_KEY) throw new Error("VIN API key not configured");
+  if (!VIN_API_NINJAS_KEY) throw new Error("VIN_API_NINJAS_KEY not configured");
   const r = await fetch(`https://api.api-ninjas.com/v1/vinlookup?vin=${encodeURIComponent(vin)}`, {
     headers: { "X-Api-Key": VIN_API_NINJAS_KEY },
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error("VIN decode failed");
   return data;
-}
-
-async function bingOneImage(query) {
-  if (!BING_IMAGE_KEY) throw new Error("Bing Image key not configured");
-  const u = new URL(BING_IMAGE_ENDPOINT);
-  u.searchParams.set("q", query);
-  u.searchParams.set("count", "1");
-  u.searchParams.set("safeSearch", "Strict");
-  u.searchParams.set("imageType", "Photo");
-
-  const r = await fetch(u.toString(), {
-    headers: { "Ocp-Apim-Subscription-Key": BING_IMAGE_KEY },
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error("Bing image search failed");
-  const first = data?.value?.[0];
-  return first?.contentUrl || "";
 }
 
 function buildCarQuery(decoded, color) {
@@ -372,7 +354,28 @@ function buildCarQuery(decoded, color) {
   const trim = decoded?.trim || decoded?.series || "";
   const body = decoded?.body_class || decoded?.bodyType || "";
   const c = (color || "").trim();
-  return `${year} ${make} ${model} ${body} ${trim} ${c} photo`.replace(/\s+/g, " ").trim();
+  return `${year} ${make} ${model} ${body} ${trim} ${c} car photo`.replace(/\s+/g, " ").trim();
+}
+
+async function pexelsOneImage(query) {
+  if (!PEXELS_KEY) throw new Error("PEXELS_KEY not configured");
+
+  const url = new URL("https://api.pexels.com/v1/search");
+  url.searchParams.set("query", query);
+  url.searchParams.set("per_page", "1");
+  url.searchParams.set("orientation", "landscape");
+  url.searchParams.set("size", "large");
+
+  const r = await fetch(url.toString(), {
+    headers: { Authorization: PEXELS_KEY },
+  });
+
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error("Pexels search failed");
+
+  // Pexels response: photos[0].src.large / original
+  const p = data?.photos?.[0];
+  return p?.src?.large || p?.src?.original || "";
 }
 
 // =============== BOT: /start ===============
@@ -458,7 +461,7 @@ bot.action(/^noop:/i, async (ctx) => {
 
 // =============== API ===============
 app.get("/", (_req, res) => res.status(200).send("OK"));
-app.get("/api/ping", (_req, res) => res.json({ ok: true, version: "2026-02-12_fixfast_pg_v3_vin_photos" }));
+app.get("/api/ping", (_req, res) => res.json({ ok: true, version: "2026-02-12_fixfast_pg_v4_vin_pexels" }));
 
 function requireAuth(req, res) {
   const initData = req.body?.initData || "";
@@ -653,7 +656,7 @@ app.post("/api/garage/delete", async (req, res) => {
   }
 });
 
-// VIN decode + auto photo (1 img) + save
+// VIN decode + auto photo (1 img) + save (Pexels)
 app.post("/api/car/vin-auto-photo", async (req, res) => {
   try {
     const tgUser = requireAuth(req, res);
@@ -674,8 +677,19 @@ app.post("/api/car/vin-auto-photo", async (req, res) => {
 
     const decoded = await decodeVin(vin);
 
-    const query = buildCarQuery(decoded, color);
-    const url = await bingOneImage(query);
+    // 1st attempt: rich query
+    let query = buildCarQuery(decoded, color);
+    let url = await pexelsOneImage(query);
+
+    // fallback: simpler query if no result
+    if (!url) {
+      const year = decoded?.year || "";
+      const make = decoded?.make || "";
+      const model = decoded?.model || "";
+      const c = (color || "").trim();
+      query = `${year} ${make} ${model} ${c} car photo`.replace(/\s+/g, " ").trim();
+      url = await pexelsOneImage(query);
+    }
 
     await pool.query(`UPDATE cars SET vin=$2, color=$3, updated_at=now() WHERE id=$1 AND user_id=$4`, [
       carId,
@@ -687,7 +701,7 @@ app.post("/api/car/vin-auto-photo", async (req, res) => {
     let photoId = "";
     if (url) {
       photoId = crypto.randomUUID();
-      await pool.query(`INSERT INTO car_photos (id, car_id, url, source) VALUES ($1,$2,$3,'bing')`, [photoId, carId, url]);
+      await pool.query(`INSERT INTO car_photos (id, car_id, url, source) VALUES ($1,$2,$3,'pexels')`, [photoId, carId, url]);
     }
 
     return res.json({ ok: true, decoded, query, photoUrl: url, photoId });
