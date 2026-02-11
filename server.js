@@ -56,4 +56,6 @@ app.post("/api/request", async (req, res) => {
 function escapeHtml(str) {
   return String(str)
     .replaceAll("&", "&amp;")
-    .replaceAll("<"
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
