@@ -109,4 +109,67 @@ app.post("/api/request", async (req, res) => {
     const description = String(body.description || "").trim();
 
     // гараж (опционально)
-    const car
+    const car = body.car || null; // ожидаем { title, plate, carClass, ... }
+
+    // пользователь
+    const tgUser = body.tgUser || null; // { id, first_name, username }
+    const initData = String(body.initData || ""); // пока не валидируем, просто принимаем
+
+    if (!category || !description) {
+      return res.status(400).json({ ok: false, error: "Missing category/description" });
+    }
+
+    const topicId = pickTopicId(category);
+    if (!topicId) {
+      return res.status(400).json({ ok: false, error: "Unknown category/topic" });
+    }
+
+    const clientLine = tgUser?.username
+      ? `@${escapeHtml(tgUser.username)}`
+      : tgUser?.first_name
+        ? escapeHtml(tgUser.first_name)
+        : "WebApp";
+
+    // если выбрали авто из гаража — показываем его, иначе используем введённые поля
+    const carTitle = car?.title ? String(car.title).trim() : "";
+    const carPlate = car?.plate ? String(car.plate).trim() : "";
+
+    const html =
+      `🆕 <b>Новая заявка</b>\n` +
+      `Категория: <b>${escapeHtml(category)}</b>\n` +
+      (carTitle ? `Авто: <b>${escapeHtml(carTitle)}</b>\n` : `Модель: <b>${escapeHtml(carModel)}</b>\n`) +
+      (carPlate ? `Госномер: <b>${escapeHtml(carPlate)}</b>\n` : "") +
+      `Класс: <b>${escapeHtml(car?.carClass || carClass || "—")}</b>\n` +
+      `Описание: <b>${escapeHtml(description)}</b>\n\n` +
+      `Клиент: <b>${clientLine}</b>` +
+      (tgUser?.id ? ` (${escapeHtml(tgUser.id)})` : "") +
+      `\n🕒 ${escapeHtml(new Date().toLocaleString("ru-RU"))}`;
+
+    await sendToTopic(topicId, html);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("API /api/request error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// ================== HEALTHCHECK ==================
+app.get("/", (_, res) => res.status(200).send("OK"));
+app.get("/health", (_, res) => res.status(200).json({ ok: true }));
+
+// ================== WEBHOOK MIDDLEWARE ==================
+app.use(bot.webhookCallback(WEBHOOK_PATH));
+
+// ================== START ==================
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, async () => {
+  try {
+    await bot.telegram.setWebhook(WEBHOOK_URL);
+    console.log("Webhook set to:", WEBHOOK_URL);
+  } catch (e) {
+    console.error("Failed to set webhook:", e);
+  }
+  console.log("Server listening on port:", PORT);
+});
