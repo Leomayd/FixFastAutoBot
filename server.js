@@ -1,12 +1,25 @@
+// server.js
 import express from "express";
-import path from "path";
-import fs from "fs";
-import crypto from "crypto";
 
 const app = express();
-app.use(express.json());
 
-// --- helpers ---
+/**
+ * ====== CORS + preflight (чтобы Telegram WebApp / браузер не падал с "Load failed") ======
+ */
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*"); // для WebApp проще так
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+app.use(express.json({ limit: "1mb" }));
+
+/**
+ * ====== ENV ======
+ */
 function requiredEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env ${name}`);
@@ -14,126 +27,122 @@ function requiredEnv(name) {
 }
 
 const BOT_TOKEN = requiredEnv("BOT_TOKEN");
-const MANAGER_CHAT_ID = requiredEnv("MANAGER_CHAT_ID"); // supergroup id (-100...)
-const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const MANAGER_CHAT_ID = requiredEnv("MANAGER_CHAT_ID"); // супергруппа -100...
+// Топики:
+const THREAD_WASH = Number(requiredEnv("THREAD_WASH")); // мойка/шиномонтаж = 2
+const THREAD_TO = Number(requiredEnv("THREAD_TO")); // ТО/ремонт = 4
+const THREAD_DETAIL = Number(requiredEnv("THREAD_DETAIL")); // детейлинг = 6
+const THREAD_BODY = Number(requiredEnv("THREAD_BODY")); // кузовной = 8
+const THREAD_TUNING = Number(requiredEnv("THREAD_TUNING")); // тюнинг = 10
 
-const TOPIC_MAP = [
-  { key: "Мойка/шиномонтаж", env: "TOPIC_ID_WASH" },
-  { key: "ТО/Ремонт", env: "TOPIC_ID_SERVICE" },
-  { key: "Кузовной ремонт", env: "TOPIC_ID_BODY" },
-  { key: "Детейлинг", env: "TOPIC_ID_DETAILING" },
-  { key: "Тюнинг", env: "TOPIC_ID_TUNING" },
-];
+const PORT = process.env.PORT || 10000;
 
-function topicIdByCategory(category) {
-  const row = TOPIC_MAP.find((x) => x.key === category);
-  if (!row) return null;
-  const v = process.env[row.env];
-  return v ? Number(v) : null;
-}
+const CATEGORY_TO_THREAD = {
+  "Мойка/шиномонтаж": THREAD_WASH,
+  "ТО/Ремонт": THREAD_TO,
+  "Детейлинг": THREAD_DETAIL,
+  "Кузовной ремонт": THREAD_BODY,
+  "Тюнинг": THREAD_TUNING,
+};
 
-function escapeHtml(s = "") {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+function esc(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 async function tgSendMessage({ chat_id, text, message_thread_id }) {
-  const body = { chat_id, text, parse_mode: "HTML" };
-  if (message_thread_id) body.message_thread_id = message_thread_id;
+  const url = https://api.telegram.org/bot${BOT_TOKEN}/sendMessage;
 
-  const res = await fetch(`${TELEGRAM_API}/sendMessage`, {
+  const payload = {
+    chat_id,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+
+  // ВНИМАНИЕ: message_thread_id добавляем только если он есть
+  if (message_thread_id) payload.message_thread_id = message_thread_id;
+
+  const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
 
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data?.ok === false) {
-    throw new Error(data?.description || "Telegram sendMessage failed");
+  const data = await r.json().catch(() => null);
+  if (!r.ok || !data?.ok) {
+    const msg = data?.description || Telegram API error, status=${r.status};
+    throw new Error(msg);
   }
   return data.result;
 }
 
-// --- simple file "db" ---
-const DATA_DIR = path.join(process.cwd(), "data");
-const DB_FILE = path.join(DATA_DIR, "requests.json");
+/**
+ * ====== Health ======
+ */
+app.get("/api/health", (req, res) => {
+  res.status(200).send("ok");
+});
 
-function ensureDb() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify([]), "utf-8");
-}
-ensureDb();
-
-function dbInsert(reqObj) {
-  const arr = JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
-  arr.push(reqObj);
-  fs.writeFileSync(DB_FILE, JSON.stringify(arr, null, 2), "utf-8");
-}
-
-// --- routes ---
-app.get("/", (req, res) => res.send("OK"));
-
+/**
+ * ====== Main endpoint ======
+ * Ожидаем:
+ * {
+ *   category: "ТО/Ремонт" | ...,
+ *   carClass: "Бизнес",
+ *   carModel: "BMW 5",
+ *   description: "...",
+ *   tgUser: { id, first_name, username }  // можно слать из миниаппа
+ * }
+ */
 app.post("/api/request", async (req, res) => {
   try {
-    const { category, carClass, carModel, description, tgUser, initData } = req.body || {};
+    const { category, carClass, carModel, description, tgUser } = req.body || {};
 
-    if (!category || !carModel || !description) {
-      return res.status(400).json({ ok: false, error: "Missing fields: category, carModel, description" });
+    const cat = String(category || "").trim();
+    const cls = String(carClass || "").trim();
+    const model = String(carModel || "").trim();
+    const desc = String(description || "").trim();
+
+    if (!cat  !cls  !model || !desc) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing fields: category, carClass, carModel, description are required",
+      });
     }
 
-    const topicId = topicIdByCategory(category);
-    if (!topicId) {
-      return res.status(400).json({ ok: false, error: `Unknown category or topic not configured: ${category}` });
-    }
+    const threadId = CATEGORY_TO_THREAD[cat] || null;
 
-    const id = crypto.randomUUID();
-    const createdAt = new Date().toISOString();
-
-    const userLine = tgUser?.username
-      ? `@${escapeHtml(tgUser.username)}`
-      : tgUser?.first_name
-        ? escapeHtml(tgUser.first_name)
-        : "unknown";
-
-    const userIdLine = tgUser?.id ? ` (${tgUser.id})` : "";
+    const userFirst = tgUser?.first_name ? esc(tgUser.first_name) : "—";
+    const userName = tgUser?.username ? "@" + esc(tgUser.username) : "—";
+    const userId = tgUser?.id ? esc(tgUser.id) : "—";
 
     const text =
-      `🚗 <b>Новая заявка</b>\n` +
-      `Категория: <b>${escapeHtml(category)}</b>\n` +
-      `Класс: <b>${escapeHtml(carClass || "—")}</b>\n` +
-      `Модель: <b>${escapeHtml(carModel)}</b>\n` +
-      `Описание: <b>${escapeHtml(description)}</b>\n\n` +
-      `Клиент: <b>${userLine}</b>${escapeHtml(userIdLine)}\n` +
-      `ID заявки: <code>${id}</code>\n` +
-      `Время: <code>${createdAt}</code>`;
+      <b>Новая заявка</b>\n +
+      <b>Категория:</b> ${esc(cat)}\n +
+      <b>Класс:</b> ${esc(cls)}\n +
+      <b>Марка/модель:</b> ${esc(model)}\n +
+      <b>Описание:</b> ${esc(desc)}\n\n +
+      <b>Клиент:</b> ${userFirst}\n +
+      <b>Username:</b> ${userName}\n +
+      <b>User ID:</b> ${userId};
 
-    // 1) send to managers topic
+    // 1) Отправляем менеджерам (в супергруппу, в нужный топик)
     await tgSendMessage({
       chat_id: MANAGER_CHAT_ID,
-      message_thread_id: topicId,
+      message_thread_id: threadId, // вот здесь ключ
       text,
     });
 
-    // 2) save to "db"
-    dbInsert({
-      id,
-      createdAt,
-      category,
-      carClass: carClass || "",
-      carModel,
-      description,
-      tgUser: tgUser || null,
-      initData: initData || null,
-    });
-
-    return res.json({ ok: true, id });
+    return res.json({ ok: true });
   } catch (e) {
     console.error("ERR /api/request:", e);
     return res.status(500).json({ ok: false, error: e.message || "Server error" });
   }
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Server listening on port", PORT));
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
