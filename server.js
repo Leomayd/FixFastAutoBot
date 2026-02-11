@@ -1,148 +1,159 @@
-// server.js
 import express from "express";
+import { Telegraf, Markup } from "telegraf";
 
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const PUBLIC_URL = process.env.PUBLIC_URL; // например: https://your-service.onrender.com
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // id форум-чата (где топики)
+
+if (!BOT_TOKEN) throw new Error("BOT_TOKEN env is required");
+if (!PUBLIC_URL) throw new Error("PUBLIC_URL env is required");
+if (!ADMIN_CHAT_ID) throw new Error("ADMIN_CHAT_ID env is required");
+
+const bot = new Telegraf(BOT_TOKEN);
 const app = express();
+app.use(express.json());
 
-/**
- * ====== CORS + preflight (чтобы Telegram WebApp / браузер не падал с "Load failed") ======
- */
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*"); // для WebApp проще так
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+const WEBHOOK_PATH = `/telegraf/${BOT_TOKEN}`;
+const WEBHOOK_URL = `${PUBLIC_URL}${WEBHOOK_PATH}`;
 
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-app.use(express.json({ limit: "1mb" }));
-
-/**
- * ====== ENV ======
- */
-function requiredEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env ${name}`);
-  return v;
-}
-
-const BOT_TOKEN = requiredEnv("BOT_TOKEN");
-const MANAGER_CHAT_ID = requiredEnv("MANAGER_CHAT_ID"); // супергруппа -100...
-// Топики:
-const THREAD_WASH = Number(requiredEnv("THREAD_WASH")); // мойка/шиномонтаж = 2
-const THREAD_TO = Number(requiredEnv("THREAD_TO")); // ТО/ремонт = 4
-const THREAD_DETAIL = Number(requiredEnv("THREAD_DETAIL")); // детейлинг = 6
-const THREAD_BODY = Number(requiredEnv("THREAD_BODY")); // кузовной = 8
-const THREAD_TUNING = Number(requiredEnv("THREAD_TUNING")); // тюнинг = 10
-
-const PORT = process.env.PORT || 10000;
-
-const CATEGORY_TO_THREAD = {
-  "Мойка/шиномонтаж": THREAD_WASH,
-  "ТО/Ремонт": THREAD_TO,
-  "Детейлинг": THREAD_DETAIL,
-  "Кузовной ремонт": THREAD_BODY,
-  "Тюнинг": THREAD_TUNING,
+// ====== ТВОИ ТОПИКИ (из твоего сообщения) ======
+const TOPICS = {
+  wash_tires: 2,     // мойка / шиномонтаж
+  service: 4,        // ТО/Ремонт
+  detailing: 6,      // детейлинг
+  bodywork: 8,       // кузовной ремонт
+  tuning: 10         // тюнинг
 };
 
-function esc(s) {
-  return String(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+// ====== УТИЛИТЫ ======
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
 }
 
-async function tgSendMessage({ chat_id, text, message_thread_id }) {
-  const url = https://api.telegram.org/bot${BOT_TOKEN}/sendMessage;
+async function sendToForumTopic(topicKey, htmlText) {
+  const threadId = TOPICS[topicKey];
+  if (!threadId) throw new Error(`Unknown topicKey: ${topicKey}`);
 
-  const payload = {
-    chat_id,
-    text,
+  return bot.telegram.sendMessage(ADMIN_CHAT_ID, htmlText, {
     parse_mode: "HTML",
-    disable_web_page_preview: true,
-  };
-
-  // ВНИМАНИЕ: message_thread_id добавляем только если он есть
-  if (message_thread_id) payload.message_thread_id = message_thread_id;
-
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    message_thread_id: threadId,
+    disable_web_page_preview: true
   });
-
-  const data = await r.json().catch(() => null);
-  if (!r.ok || !data?.ok) {
-    const msg = data?.description || Telegram API error, status=${r.status};
-    throw new Error(msg);
-  }
-  return data.result;
 }
 
-/**
- * ====== Health ======
- */
-app.get("/api/health", (req, res) => {
-  res.status(200).send("ok");
+// ====== КНОПКИ ВЫБОРА УСЛУГИ ======
+const serviceKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback("🧼 Мойка / Шиномонтаж", "svc:wash_tires")],
+  [Markup.button.callback("🔧 ТО / Ремонт", "svc:service")],
+  [Markup.button.callback("✨ Детейлинг", "svc:detailing")],
+  [Markup.button.callback("🎨 Кузовной ремонт", "svc:bodywork")],
+  [Markup.button.callback("⚙️ Тюнинг", "svc:tuning")]
+]);
+
+// ====== ПАМЯТЬ ДИАЛОГА (in-memory, для MVP) ======
+const userState = new Map(); // userId -> { step, topicKey, data }
+
+function setState(userId, patch) {
+  const prev = userState.get(userId) || {};
+  userState.set(userId, { ...prev, ...patch });
+}
+
+function clearState(userId) {
+  userState.delete(userId);
+}
+
+// ====== BOT FLOW ======
+bot.start(async (ctx) => {
+  clearState(ctx.from.id);
+  await ctx.reply("Выбери услугу, чтобы оставить заявку 👇", serviceKeyboard);
 });
 
-/**
- * ====== Main endpoint ======
- * Ожидаем:
- * {
- *   category: "ТО/Ремонт" | ...,
- *   carClass: "Бизнес",
- *   carModel: "BMW 5",
- *   description: "...",
- *   tgUser: { id, first_name, username }  // можно слать из миниаппа
- * }
- */
-app.post("/api/request", async (req, res) => {
-  try {
-    const { category, carClass, carModel, description, tgUser } = req.body || {};
+bot.action(/^svc:(.+)$/i, async (ctx) => {
+  const topicKey = ctx.match[1];
 
-    const cat = String(category || "").trim();
-    const cls = String(carClass || "").trim();
-    const model = String(carModel || "").trim();
-    const desc = String(description || "").trim();
+  if (!TOPICS[topicKey]) {
+    await ctx.answerCbQuery("Неизвестный раздел");
+    return;
+  }
 
-    if (!cat  !cls  !model || !desc) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing fields: category, carClass, carModel, description are required",
-      });
+  setState(ctx.from.id, { step: "name", topicKey, data: {} });
+
+  await ctx.answerCbQuery("Ок");
+  await ctx.reply("Как вас зовут?");
+});
+
+bot.on("text", async (ctx) => {
+  const st = userState.get(ctx.from.id);
+  if (!st) {
+    await ctx.reply("Нажми /start и выбери услугу 👇");
+    return;
+  }
+
+  const text = ctx.message.text.trim();
+
+  if (st.step === "name") {
+    setState(ctx.from.id, { step: "phone", data: { ...st.data, name: text } });
+    await ctx.reply("Телефон для связи?");
+    return;
+  }
+
+  if (st.step === "phone") {
+    setState(ctx.from.id, { step: "comment", data: { ...st.data, phone: text } });
+    await ctx.reply("Комментарий к заявке (что нужно сделать)?");
+    return;
+  }
+
+  if (st.step === "comment") {
+    const data = { ...st.data, comment: text };
+
+    const user = ctx.from;
+    const who =
+      `${escapeHtml(user.first_name || "")}` +
+      (user.last_name ? ` ${escapeHtml(user.last_name)}` : "") +
+      (user.username ? ` (@${escapeHtml(user.username)})` : "");
+
+    const html =
+      `🆕 <b>Новая заявка</b>\n` +
+      `👤 ${who}\n` +
+      `🧾 <b>Имя:</b> ${escapeHtml(data.name)}\n` +
+      `📞 <b>Телефон:</b> ${escapeHtml(data.phone)}\n` +
+      `💬 <b>Комментарий:</b> ${escapeHtml(data.comment)}\n` +
+      `🕒 ${escapeHtml(new Date().toLocaleString("ru-RU"))}`;
+
+    try {
+      await sendToForumTopic(st.topicKey, html);
+      await ctx.reply("✅ Заявка отправлена! Скоро с вами свяжутся.");
+    } catch (e) {
+      console.error("Failed to send заявку:", e);
+      await ctx.reply("❌ Не смог отправить заявку. Попробуй ещё раз или напиши админу.");
+    } finally {
+      clearState(ctx.from.id);
     }
-
-    const threadId = CATEGORY_TO_THREAD[cat] || null;
-
-    const userFirst = tgUser?.first_name ? esc(tgUser.first_name) : "—";
-    const userName = tgUser?.username ? "@" + esc(tgUser.username) : "—";
-    const userId = tgUser?.id ? esc(tgUser.id) : "—";
-
-    const text =
-      <b>Новая заявка</b>\n +
-      <b>Категория:</b> ${esc(cat)}\n +
-      <b>Класс:</b> ${esc(cls)}\n +
-      <b>Марка/модель:</b> ${esc(model)}\n +
-      <b>Описание:</b> ${esc(desc)}\n\n +
-      <b>Клиент:</b> ${userFirst}\n +
-      <b>Username:</b> ${userName}\n +
-      <b>User ID:</b> ${userId};
-
-    // 1) Отправляем менеджерам (в супергруппу, в нужный топик)
-    await tgSendMessage({
-      chat_id: MANAGER_CHAT_ID,
-      message_thread_id: threadId, // вот здесь ключ
-      text,
-    });
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("ERR /api/request:", e);
-    return res.status(500).json({ ok: false, error: e.message || "Server error" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+// ====== WEBHOOK ======
+app.use(bot.webhookCallback(WEBHOOK_PATH));
+
+// healthcheck
+app.get("/", (_, res) => res.status(200).send("OK"));
+
+const PORT = process.env.PORT || 3000;
+
+async function bootstrap() {
+  // Важно: поднимем вебхук ДО старта сервера — Telegraf норм, но лучше после listen
+  app.listen(PORT, async () => {
+    try {
+      await bot.telegram.setWebhook(WEBHOOK_URL);
+      console.log("Webhook set to:", WEBHOOK_URL);
+      console.log("Server listening on port:", PORT);
+    } catch (e) {
+      console.error("Failed to set webhook:", e);
+    }
+  });
+}
+
+bootstrap();
