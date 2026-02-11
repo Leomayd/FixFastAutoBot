@@ -3,7 +3,7 @@ import crypto from "crypto";
 import { Telegraf, Markup } from "telegraf";
 import pg from "pg";
 
-console.log("SERVER VERSION: 2026-02-12_fixfast_pg_v2_garage_bonus");
+console.log("SERVER VERSION: 2026-02-12_fixfast_pg_v3_vin_photos");
 
 // =============== ENV ===============
 const BOT_TOKEN = (process.env.BOT_TOKEN || "").trim();
@@ -20,6 +20,11 @@ const TOPIC_ID_TUNING = (process.env.TOPIC_ID_TUNING || "").trim();
 
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 
+// VIN + Images
+const VIN_API_NINJAS_KEY = (process.env.VIN_API_NINJAS_KEY || "").trim();
+const BING_IMAGE_KEY = (process.env.BING_IMAGE_KEY || "").trim();
+const BING_IMAGE_ENDPOINT = (process.env.BING_IMAGE_ENDPOINT || "https://api.bing.microsoft.com/v7.0/images/search").trim();
+
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN env is required");
 if (!PUBLIC_URL) throw new Error("PUBLIC_URL env is required");
 if (!MANAGER_CHAT_ID) throw new Error("MANAGER_CHAT_ID env is required");
@@ -28,14 +33,14 @@ if (!DATABASE_URL) throw new Error("DATABASE_URL env is required");
 
 // =============== APP ===============
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 app.use((req, _res, next) => {
   console.log(`[HTTP] ${req.method} ${req.url}`);
   next();
 });
 
-// CORS (миниапп на Vercel)
+// CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -78,7 +83,6 @@ const pool = new Pool({
 });
 
 async function dbInit() {
-  // users
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       user_id text PRIMARY KEY,
@@ -90,7 +94,6 @@ async function dbInit() {
     );
   `);
 
-  // cars
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cars (
       id uuid PRIMARY KEY,
@@ -102,9 +105,13 @@ async function dbInit() {
       updated_at timestamptz NOT NULL DEFAULT now()
     );
   `);
+
+  // add columns if not exists
+  await pool.query(`ALTER TABLE cars ADD COLUMN IF NOT EXISTS vin text NOT NULL DEFAULT '';`);
+  await pool.query(`ALTER TABLE cars ADD COLUMN IF NOT EXISTS color text NOT NULL DEFAULT '';`);
+
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_cars_user_id_created_at ON cars (user_id, created_at DESC);`);
 
-  // requests
   await pool.query(`
     CREATE TABLE IF NOT EXISTS requests (
       id uuid PRIMARY KEY,
@@ -121,10 +128,10 @@ async function dbInit() {
       updated_at timestamptz NOT NULL DEFAULT now()
     );
   `);
+
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_requests_user_id_created_at ON requests (user_id, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_requests_status ON requests (status);`);
 
-  // bonus ledger: один done = один бонус-транзакшн (уникально по request_id)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bonus_tx (
       id uuid PRIMARY KEY,
@@ -137,6 +144,18 @@ async function dbInit() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_bonus_tx_user_id_created_at ON bonus_tx (user_id, created_at DESC);`);
+
+  // car photos
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS car_photos (
+      id uuid PRIMARY KEY,
+      car_id uuid NOT NULL REFERENCES cars(id) ON DELETE CASCADE,
+      url text NOT NULL,
+      source text NOT NULL DEFAULT 'bing',
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_car_photos_car_id_created_at ON car_photos (car_id, created_at DESC);`);
 
   console.log("[DB] init ok");
 }
@@ -164,7 +183,6 @@ function verifyInitData(initData) {
 
   if (calcHash !== hash) return { ok: false, error: "initData hash invalid" };
 
-  // user is JSON in params
   const userRaw = params.get("user");
   if (!userRaw) return { ok: false, error: "no user in initData" };
 
@@ -301,10 +319,8 @@ async function getBonusPoints(userId) {
 }
 
 async function awardDoneBonusIfNeeded(reqRow) {
-  // начисляем только когда статус стал done
   if (reqRow.status !== "done") return;
 
-  // одна транзакция на заявку
   const txId = mkId();
   try {
     await pool.query(
@@ -313,9 +329,50 @@ async function awardDoneBonusIfNeeded(reqRow) {
       [txId, reqRow.user_id, reqRow.id, BONUS_PER_DONE]
     );
   } catch (e) {
-    // unique violation => уже начисляли, это ок
     if (String(e?.code) !== "23505") throw e;
   }
+}
+
+// ===== VIN + IMAGE helpers =====
+function isValidVin(vin) {
+  return /^[A-HJ-NPR-Z0-9]{17}$/.test(vin);
+}
+
+async function decodeVin(vin) {
+  if (!VIN_API_NINJAS_KEY) throw new Error("VIN API key not configured");
+  const r = await fetch(`https://api.api-ninjas.com/v1/vinlookup?vin=${encodeURIComponent(vin)}`, {
+    headers: { "X-Api-Key": VIN_API_NINJAS_KEY },
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error("VIN decode failed");
+  return data;
+}
+
+async function bingOneImage(query) {
+  if (!BING_IMAGE_KEY) throw new Error("Bing Image key not configured");
+  const u = new URL(BING_IMAGE_ENDPOINT);
+  u.searchParams.set("q", query);
+  u.searchParams.set("count", "1");
+  u.searchParams.set("safeSearch", "Strict");
+  u.searchParams.set("imageType", "Photo");
+
+  const r = await fetch(u.toString(), {
+    headers: { "Ocp-Apim-Subscription-Key": BING_IMAGE_KEY },
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error("Bing image search failed");
+  const first = data?.value?.[0];
+  return first?.contentUrl || "";
+}
+
+function buildCarQuery(decoded, color) {
+  const year = decoded?.year || "";
+  const make = decoded?.make || "";
+  const model = decoded?.model || "";
+  const trim = decoded?.trim || decoded?.series || "";
+  const body = decoded?.body_class || decoded?.bodyType || "";
+  const c = (color || "").trim();
+  return `${year} ${make} ${model} ${body} ${trim} ${c} photo`.replace(/\s+/g, " ").trim();
 }
 
 // =============== BOT: /start ===============
@@ -343,12 +400,11 @@ bot.start(sendWelcome);
 bot.hears(/^\/start$/i, sendWelcome);
 bot.on("message", async () => {});
 
-// manager кнопки статуса
+// manager buttons
 bot.action(/^req:([a-f0-9-]+):(new|inwork|done|canceled)$/i, async (ctx) => {
   const reqId = ctx.match[1];
   const newStatus = ctx.match[2];
 
-  // обновим в БД и вернем строку
   const { rows } = await pool.query(
     `UPDATE requests
      SET status = $2, updated_at = now()
@@ -367,14 +423,12 @@ bot.action(/^req:([a-f0-9-]+):(new|inwork|done|canceled)$/i, async (ctx) => {
     if (typeof r.car === "string") r.car = JSON.parse(r.car);
   } catch {}
 
-  // ✅ бонусы — на сервере (тут же, при done)
   try {
     await awardDoneBonusIfNeeded(r);
   } catch (e) {
     console.error("award bonus error:", e);
   }
 
-  // обновим сообщение менеджерам (edit)
   const html = buildManagerHtml(r);
 
   try {
@@ -387,7 +441,6 @@ bot.action(/^req:([a-f0-9-]+):(new|inwork|done|canceled)$/i, async (ctx) => {
     console.warn("editMessageText failed:", e?.message || e);
   }
 
-  // пинганём клиента
   try {
     await bot.telegram.sendMessage(
       r.user_id,
@@ -404,9 +457,8 @@ bot.action(/^noop:/i, async (ctx) => {
 });
 
 // =============== API ===============
-// health
 app.get("/", (_req, res) => res.status(200).send("OK"));
-app.get("/api/ping", (_req, res) => res.json({ ok: true, version: "2026-02-12_fixfast_pg_v2_garage_bonus" }));
+app.get("/api/ping", (_req, res) => res.json({ ok: true, version: "2026-02-12_fixfast_pg_v3_vin_photos" }));
 
 function requireAuth(req, res) {
   const initData = req.body?.initData || "";
@@ -418,7 +470,7 @@ function requireAuth(req, res) {
   return v.user;
 }
 
-// профиль: user + cars + active + points
+// profile: user + garage + active + points + preview photo
 app.post("/api/profile", async (req, res) => {
   try {
     const tgUser = requireAuth(req, res);
@@ -427,12 +479,25 @@ app.post("/api/profile", async (req, res) => {
     const userRow = await ensureUser(tgUser);
 
     const { rows: carRows } = await pool.query(
-      `SELECT id, title, car_class, plate
+      `SELECT id, title, car_class, plate, vin, color
        FROM cars
        WHERE user_id=$1
        ORDER BY created_at DESC`,
       [tgUser.id]
     );
+
+    const ids = carRows.map((c) => c.id);
+    let previewByCar = {};
+    if (ids.length) {
+      const { rows: p } = await pool.query(
+        `SELECT DISTINCT ON (car_id) car_id, url
+         FROM car_photos
+         WHERE car_id = ANY($1)
+         ORDER BY car_id, created_at DESC`,
+        [ids]
+      );
+      for (const row of p) previewByCar[row.car_id] = row.url;
+    }
 
     const points = await getBonusPoints(tgUser.id);
 
@@ -444,6 +509,9 @@ app.post("/api/profile", async (req, res) => {
         title: c.title,
         carClass: c.car_class,
         plate: c.plate || "",
+        vin: c.vin || "",
+        color: c.color || "",
+        photo: previewByCar[c.id] || "",
       })),
       activeCarId: userRow?.active_car_id || "",
       points,
@@ -464,7 +532,7 @@ app.post("/api/garage/add", async (req, res) => {
 
     const title = String(req.body?.title || "").trim();
     const carClass = String(req.body?.carClass || "").trim();
-    const plate = String(req.body?.plate || "").trim();
+    const plate = String(req.body?.plate || "").trim().toUpperCase();
 
     if (!title || !carClass) return res.status(400).json({ ok: false, error: "title and carClass required" });
 
@@ -478,7 +546,6 @@ app.post("/api/garage/add", async (req, res) => {
       plate || "",
     ]);
 
-    // если active_car_id пуст — делаем этот авто активным
     const { rows } = await pool.query(`SELECT active_car_id FROM users WHERE user_id=$1`, [tgUser.id]);
     const active = rows[0]?.active_car_id || null;
     if (!active) {
@@ -489,6 +556,45 @@ app.post("/api/garage/add", async (req, res) => {
   } catch (e) {
     console.error("POST /api/garage/add error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// garage update (plate/vin/color)
+app.post("/api/garage/update", async (req, res) => {
+  try {
+    const tgUser = requireAuth(req, res);
+    if (!tgUser) return;
+
+    await ensureUser(tgUser);
+
+    const carId = String(req.body?.carId || "").trim();
+    const plate = String(req.body?.plate || "").trim().toUpperCase();
+    const vin = String(req.body?.vin || "").trim().toUpperCase();
+    const color = String(req.body?.color || "").trim();
+
+    if (!carId) return res.status(400).json({ ok: false, error: "carId required" });
+
+    const { rows: owned } = await pool.query(`SELECT id FROM cars WHERE id=$1 AND user_id=$2`, [carId, tgUser.id]);
+    if (!owned[0]) return res.status(403).json({ ok: false, error: "forbidden" });
+
+    if (vin && !isValidVin(vin)) {
+      return res.status(400).json({ ok: false, error: "VIN некорректный (17 символов, без I/O/Q)" });
+    }
+
+    await pool.query(
+      `UPDATE cars
+       SET plate = COALESCE($3,''),
+           vin = COALESCE($4,''),
+           color = COALESCE($5,''),
+           updated_at = now()
+       WHERE id=$1 AND user_id=$2`,
+      [carId, tgUser.id, plate || "", vin || "", color || ""]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /api/garage/update error:", e);
+    res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
@@ -503,7 +609,6 @@ app.post("/api/garage/set-active", async (req, res) => {
     const carId = String(req.body?.carId || "").trim();
     if (!carId) return res.status(400).json({ ok: false, error: "carId required" });
 
-    // проверим что авто принадлежит пользователю
     const { rows: cars } = await pool.query(`SELECT id FROM cars WHERE id=$1 AND user_id=$2`, [carId, tgUser.id]);
     if (!cars[0]) return res.status(403).json({ ok: false, error: "forbidden" });
 
@@ -529,7 +634,6 @@ app.post("/api/garage/delete", async (req, res) => {
 
     await pool.query(`DELETE FROM cars WHERE id=$1 AND user_id=$2`, [carId, tgUser.id]);
 
-    // если удалили активное — поставим новое активное (последнее созданное)
     const { rows: uRows } = await pool.query(`SELECT active_car_id FROM users WHERE user_id=$1`, [tgUser.id]);
     const active = uRows[0]?.active_car_id ? String(uRows[0].active_car_id) : "";
 
@@ -549,7 +653,51 @@ app.post("/api/garage/delete", async (req, res) => {
   }
 });
 
-// create request (from miniapp)
+// VIN decode + auto photo (1 img) + save
+app.post("/api/car/vin-auto-photo", async (req, res) => {
+  try {
+    const tgUser = requireAuth(req, res);
+    if (!tgUser) return;
+
+    await ensureUser(tgUser);
+
+    const carId = String(req.body?.carId || "").trim();
+    const vin = String(req.body?.vin || "").trim().toUpperCase();
+    const color = String(req.body?.color || "").trim();
+
+    if (!carId) return res.status(400).json({ ok: false, error: "carId required" });
+    if (!vin) return res.status(400).json({ ok: false, error: "vin required" });
+    if (!isValidVin(vin)) return res.status(400).json({ ok: false, error: "VIN некорректный (17 символов, без I/O/Q)" });
+
+    const { rows: owned } = await pool.query(`SELECT id FROM cars WHERE id=$1 AND user_id=$2`, [carId, tgUser.id]);
+    if (!owned[0]) return res.status(403).json({ ok: false, error: "forbidden" });
+
+    const decoded = await decodeVin(vin);
+
+    const query = buildCarQuery(decoded, color);
+    const url = await bingOneImage(query);
+
+    await pool.query(`UPDATE cars SET vin=$2, color=$3, updated_at=now() WHERE id=$1 AND user_id=$4`, [
+      carId,
+      vin,
+      color || "",
+      tgUser.id,
+    ]);
+
+    let photoId = "";
+    if (url) {
+      photoId = crypto.randomUUID();
+      await pool.query(`INSERT INTO car_photos (id, car_id, url, source) VALUES ($1,$2,$3,'bing')`, [photoId, carId, url]);
+    }
+
+    return res.json({ ok: true, decoded, query, photoUrl: url, photoId });
+  } catch (e) {
+    console.error("POST /api/car/vin-auto-photo error:", e);
+    return res.status(500).json({ ok: false, error: e?.message || "Server error" });
+  }
+});
+
+// create request
 app.post("/api/request", async (req, res) => {
   try {
     const tgUser = requireAuth(req, res);
