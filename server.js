@@ -3,7 +3,7 @@ import crypto from "crypto";
 import { Telegraf, Markup } from "telegraf";
 import pg from "pg";
 
-console.log("SERVER VERSION: 2026-02-12_fixfast_pg_v1");
+console.log("SERVER VERSION: 2026-02-12_fixfast_pg_v2_garage_bonus");
 
 // =============== ENV ===============
 const BOT_TOKEN = (process.env.BOT_TOKEN || "").trim();
@@ -35,7 +35,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-// CORS for Vercel miniapp
+// CORS (миниапп на Vercel)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -67,20 +67,48 @@ const LABELS = {
   tuning: "Тюнинг",
 };
 
+const BONUS_PER_DONE = 1000;
+
 // =============== DB ===============
 const { Pool } = pg;
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  // Render Postgres обычно требует ssl
   ssl: { rejectUnauthorized: false },
 });
 
 async function dbInit() {
+  // users
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      user_id text PRIMARY KEY,
+      username text,
+      first_name text,
+      active_car_id uuid,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+
+  // cars
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cars (
+      id uuid PRIMARY KEY,
+      user_id text NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      title text NOT NULL,
+      car_class text NOT NULL,
+      plate text NOT NULL DEFAULT '',
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_cars_user_id_created_at ON cars (user_id, created_at DESC);`);
+
+  // requests
   await pool.query(`
     CREATE TABLE IF NOT EXISTS requests (
       id uuid PRIMARY KEY,
-      user_id text NOT NULL,
+      user_id text NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
       category_key text NOT NULL,
       category_label text NOT NULL,
       car_class text NOT NULL,
@@ -93,10 +121,93 @@ async function dbInit() {
       updated_at timestamptz NOT NULL DEFAULT now()
     );
   `);
-
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_requests_user_id_created_at ON requests (user_id, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_requests_status ON requests (status);`);
+
+  // bonus ledger: один done = один бонус-транзакшн (уникально по request_id)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bonus_tx (
+      id uuid PRIMARY KEY,
+      user_id text NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      request_id uuid REFERENCES requests(id) ON DELETE SET NULL,
+      delta int NOT NULL,
+      reason text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE (user_id, request_id, reason)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_bonus_tx_user_id_created_at ON bonus_tx (user_id, created_at DESC);`);
+
   console.log("[DB] init ok");
+}
+
+// =============== Telegram initData verify ===============
+function parseInitData(initData) {
+  const params = new URLSearchParams(initData || "");
+  const hash = params.get("hash") || "";
+  params.delete("hash");
+  const dataCheckString = Array.from(params.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\n");
+  return { hash, dataCheckString, params };
+}
+
+function verifyInitData(initData) {
+  if (!initData) return { ok: false, error: "initData required" };
+  const { hash, dataCheckString, params } = parseInitData(initData);
+
+  if (!hash || !dataCheckString) return { ok: false, error: "bad initData" };
+
+  const secretKey = crypto.createHmac("sha256", "WebAppData").update(BOT_TOKEN).digest();
+  const calcHash = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
+
+  if (calcHash !== hash) return { ok: false, error: "initData hash invalid" };
+
+  // user is JSON in params
+  const userRaw = params.get("user");
+  if (!userRaw) return { ok: false, error: "no user in initData" };
+
+  let user;
+  try {
+    user = JSON.parse(userRaw);
+  } catch {
+    return { ok: false, error: "bad user json" };
+  }
+
+  const userId = user?.id ? String(user.id) : "";
+  if (!userId) return { ok: false, error: "no user.id" };
+
+  return {
+    ok: true,
+    user: {
+      id: userId,
+      username: user?.username ? String(user.username) : null,
+      first_name: user?.first_name ? String(user.first_name) : null,
+    },
+  };
+}
+
+async function ensureUser(tgUser) {
+  const userId = tgUser.id;
+
+  await pool.query(
+    `
+    INSERT INTO users (user_id, username, first_name)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (user_id) DO UPDATE SET
+      username = EXCLUDED.username,
+      first_name = EXCLUDED.first_name,
+      updated_at = now();
+  `,
+    [userId, tgUser.username, tgUser.first_name]
+  );
+
+  const { rows } = await pool.query(`SELECT user_id, username, first_name, active_car_id FROM users WHERE user_id=$1`, [
+    userId,
+  ]);
+
+  return rows[0];
 }
 
 // =============== Utils ===============
@@ -182,6 +293,31 @@ function buildManagerHtml(r) {
   );
 }
 
+async function getBonusPoints(userId) {
+  const { rows } = await pool.query(`SELECT COALESCE(SUM(delta),0)::int AS points FROM bonus_tx WHERE user_id=$1`, [
+    userId,
+  ]);
+  return rows[0]?.points ?? 0;
+}
+
+async function awardDoneBonusIfNeeded(reqRow) {
+  // начисляем только когда статус стал done
+  if (reqRow.status !== "done") return;
+
+  // одна транзакция на заявку
+  const txId = mkId();
+  try {
+    await pool.query(
+      `INSERT INTO bonus_tx (id, user_id, request_id, delta, reason)
+       VALUES ($1, $2, $3, $4, 'done_request');`,
+      [txId, reqRow.user_id, reqRow.id, BONUS_PER_DONE]
+    );
+  } catch (e) {
+    // unique violation => уже начисляли, это ок
+    if (String(e?.code) !== "23505") throw e;
+  }
+}
+
 // =============== BOT: /start ===============
 async function sendWelcome(ctx) {
   const caption =
@@ -227,10 +363,16 @@ bot.action(/^req:([a-f0-9-]+):(new|inwork|done|canceled)$/i, async (ctx) => {
     return;
   }
 
-  // jsonb из pg может прийти строкой в некоторых окружениях — подстрахуемся
   try {
     if (typeof r.car === "string") r.car = JSON.parse(r.car);
   } catch {}
+
+  // ✅ бонусы — на сервере (тут же, при done)
+  try {
+    await awardDoneBonusIfNeeded(r);
+  } catch (e) {
+    console.error("award bonus error:", e);
+  }
 
   // обновим сообщение менеджерам (edit)
   const html = buildManagerHtml(r);
@@ -264,21 +406,162 @@ bot.action(/^noop:/i, async (ctx) => {
 // =============== API ===============
 // health
 app.get("/", (_req, res) => res.status(200).send("OK"));
-app.get("/api/ping", (_req, res) => res.json({ ok: true, version: "2026-02-12_fixfast_pg_v1" }));
+app.get("/api/ping", (_req, res) => res.json({ ok: true, version: "2026-02-12_fixfast_pg_v2_garage_bonus" }));
+
+function requireAuth(req, res) {
+  const initData = req.body?.initData || "";
+  const v = verifyInitData(initData);
+  if (!v.ok) {
+    res.status(401).json({ ok: false, error: v.error || "unauthorized" });
+    return null;
+  }
+  return v.user;
+}
+
+// профиль: user + cars + active + points
+app.post("/api/profile", async (req, res) => {
+  try {
+    const tgUser = requireAuth(req, res);
+    if (!tgUser) return;
+
+    const userRow = await ensureUser(tgUser);
+
+    const { rows: carRows } = await pool.query(
+      `SELECT id, title, car_class, plate
+       FROM cars
+       WHERE user_id=$1
+       ORDER BY created_at DESC`,
+      [tgUser.id]
+    );
+
+    const points = await getBonusPoints(tgUser.id);
+
+    return res.json({
+      ok: true,
+      user: { id: tgUser.id, username: tgUser.username, first_name: tgUser.first_name },
+      garage: carRows.map((c) => ({
+        id: c.id,
+        title: c.title,
+        carClass: c.car_class,
+        plate: c.plate || "",
+      })),
+      activeCarId: userRow?.active_car_id || "",
+      points,
+    });
+  } catch (e) {
+    console.error("POST /api/profile error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// garage add
+app.post("/api/garage/add", async (req, res) => {
+  try {
+    const tgUser = requireAuth(req, res);
+    if (!tgUser) return;
+
+    await ensureUser(tgUser);
+
+    const title = String(req.body?.title || "").trim();
+    const carClass = String(req.body?.carClass || "").trim();
+    const plate = String(req.body?.plate || "").trim();
+
+    if (!title || !carClass) return res.status(400).json({ ok: false, error: "title and carClass required" });
+
+    const id = mkId();
+
+    await pool.query(`INSERT INTO cars (id, user_id, title, car_class, plate) VALUES ($1,$2,$3,$4,$5)`, [
+      id,
+      tgUser.id,
+      title,
+      carClass,
+      plate || "",
+    ]);
+
+    // если active_car_id пуст — делаем этот авто активным
+    const { rows } = await pool.query(`SELECT active_car_id FROM users WHERE user_id=$1`, [tgUser.id]);
+    const active = rows[0]?.active_car_id || null;
+    if (!active) {
+      await pool.query(`UPDATE users SET active_car_id=$2, updated_at=now() WHERE user_id=$1`, [tgUser.id, id]);
+    }
+
+    return res.json({ ok: true, id });
+  } catch (e) {
+    console.error("POST /api/garage/add error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// set active
+app.post("/api/garage/set-active", async (req, res) => {
+  try {
+    const tgUser = requireAuth(req, res);
+    if (!tgUser) return;
+
+    await ensureUser(tgUser);
+
+    const carId = String(req.body?.carId || "").trim();
+    if (!carId) return res.status(400).json({ ok: false, error: "carId required" });
+
+    // проверим что авто принадлежит пользователю
+    const { rows: cars } = await pool.query(`SELECT id FROM cars WHERE id=$1 AND user_id=$2`, [carId, tgUser.id]);
+    if (!cars[0]) return res.status(403).json({ ok: false, error: "forbidden" });
+
+    await pool.query(`UPDATE users SET active_car_id=$2, updated_at=now() WHERE user_id=$1`, [tgUser.id, carId]);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /api/garage/set-active error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// delete car
+app.post("/api/garage/delete", async (req, res) => {
+  try {
+    const tgUser = requireAuth(req, res);
+    if (!tgUser) return;
+
+    await ensureUser(tgUser);
+
+    const carId = String(req.body?.carId || "").trim();
+    if (!carId) return res.status(400).json({ ok: false, error: "carId required" });
+
+    await pool.query(`DELETE FROM cars WHERE id=$1 AND user_id=$2`, [carId, tgUser.id]);
+
+    // если удалили активное — поставим новое активное (последнее созданное)
+    const { rows: uRows } = await pool.query(`SELECT active_car_id FROM users WHERE user_id=$1`, [tgUser.id]);
+    const active = uRows[0]?.active_car_id ? String(uRows[0].active_car_id) : "";
+
+    if (active && active === carId) {
+      const { rows: nextCars } = await pool.query(
+        `SELECT id FROM cars WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`,
+        [tgUser.id]
+      );
+      const nextId = nextCars[0]?.id || null;
+      await pool.query(`UPDATE users SET active_car_id=$2, updated_at=now() WHERE user_id=$1`, [tgUser.id, nextId]);
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /api/garage/delete error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
 
 // create request (from miniapp)
 app.post("/api/request", async (req, res) => {
   try {
-    const body = req.body || {};
+    const tgUser = requireAuth(req, res);
+    if (!tgUser) return;
 
+    await ensureUser(tgUser);
+
+    const body = req.body || {};
     const topicKey = mapCategoryToTopicKey(body.category);
     if (!topicKey) return res.status(400).json({ ok: false, error: "Unknown category" });
 
     const categoryLabel = body.category || LABELS[topicKey] || topicKey;
-
-    const tgUser = body.tgUser || null;
-    const userId = tgUser?.id ? String(tgUser.id) : "";
-    if (!userId) return res.status(400).json({ ok: false, error: "tgUser.id is required" });
 
     const carClass = String(body.carClass || "").trim();
     const carModel = String(body.carModel || "").trim();
@@ -295,7 +578,7 @@ app.post("/api/request", async (req, res) => {
        (id, user_id, category_key, category_label, car_class, car_model, description, car, status, client_line)
        VALUES
        ($1, $2, $3, $4, $5, $6, $7, $8, 'new', $9);`,
-      [reqId, userId, topicKey, String(categoryLabel), carClass, carModel, description, car, clientLine]
+      [reqId, tgUser.id, topicKey, String(categoryLabel), carClass, carModel, description, car, clientLine]
     );
 
     const html =
@@ -322,9 +605,10 @@ app.post("/api/request", async (req, res) => {
 // list my requests
 app.post("/api/my-requests", async (req, res) => {
   try {
-    const { tgUser } = req.body || {};
-    const userId = tgUser?.id ? String(tgUser.id) : "";
-    if (!userId) return res.status(400).json({ ok: false, error: "tgUser.id is required" });
+    const tgUser = requireAuth(req, res);
+    if (!tgUser) return;
+
+    await ensureUser(tgUser);
 
     const { rows } = await pool.query(
       `SELECT id, category_label, car_class, car_model, description, status, created_at, updated_at
@@ -332,7 +616,7 @@ app.post("/api/my-requests", async (req, res) => {
        WHERE user_id = $1
        ORDER BY created_at DESC
        LIMIT 50;`,
-      [userId]
+      [tgUser.id]
     );
 
     const items = rows.map((r) => ({
@@ -363,7 +647,6 @@ app.listen(PORT, async () => {
     await dbInit();
   } catch (e) {
     console.error("[DB] init failed:", e);
-    // если БД не поднялась — лучше падать, чем работать без заявок
     process.exit(1);
   }
 
