@@ -1,30 +1,11 @@
 import express from "express";
 import { Telegraf } from "telegraf";
 
-/**
- * ENV (Render -> Environment Variables)
- *
- * REQUIRED:
- * - BOT_TOKEN
- * - PUBLIC_URL              (например: https://fixfastautobot.onrender.com)
- * - MANAGER_CHAT_ID         (форум-чат id: -100...)
- * - WEBAPP_URL              (url твоего миниаппа, который открывает кнопка)
- *
- * OPTIONAL (если не заданы — будут дефолты 2/4/6/8/10):
- * - TOPIC_ID_WASH
- * - TOPIC_ID_SERVICE
- * - TOPIC_ID_DETAILING
- * - TOPIC_ID_BODY
- * - TOPIC_ID_TUNING
- *
- * OPTIONAL:
- * - WELCOME_IMAGE_URL       (картинка для приветствия: https://...jpg/png)
- */
-
 const BOT_TOKEN = (process.env.BOT_TOKEN || "").trim();
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").trim().replace(/\/$/, "");
 const MANAGER_CHAT_ID = (process.env.MANAGER_CHAT_ID || "").trim();
-const WEBAPP_URL = (process.env.WEBAPP_URL || "").trim(); // миниапп URL для кнопки
+
+const WEBAPP_URL = (process.env.WEBAPP_URL || "").trim();
 const WELCOME_IMAGE_URL = (process.env.WELCOME_IMAGE_URL || "").trim();
 
 const TOPIC_ID_WASH = (process.env.TOPIC_ID_WASH || "").trim();
@@ -43,9 +24,15 @@ const app = express();
 
 app.use(express.json({ limit: "1mb" }));
 
-// ===== CORS для Telegram WebApp =====
+// ===== request logging (чтобы поймать мини-апп) =====
+app.use((req, _res, next) => {
+  console.log(`[HTTP] ${req.method} ${req.url}`);
+  next();
+});
+
+// ===== CORS for WebApp =====
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*"); // можно ужесточить позже
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -55,7 +42,6 @@ app.use((req, res, next) => {
 const WEBHOOK_PATH = `/telegraf/${BOT_TOKEN}`;
 const WEBHOOK_URL = `${PUBLIC_URL}${WEBHOOK_PATH}`;
 
-// ===== ТВОИ ТОПИКИ (из env либо дефолт) =====
 const TOPICS = {
   wash_tires: TOPIC_ID_WASH ? Number(TOPIC_ID_WASH) : 2,
   service: TOPIC_ID_SERVICE ? Number(TOPIC_ID_SERVICE) : 4,
@@ -82,11 +68,8 @@ function escapeHtml(text) {
 function normalizeServiceKey(s) {
   const v = String(s || "").toLowerCase().trim();
   if (!v) return "";
-
-  // если фронт шлёт уже ключи: wash_tires/service/detailing/bodywork/tuning — вернём их
   if (TOPICS[v]) return v;
 
-  // если фронт шлёт русские названия/варианты
   if (["wash", "мойка", "шин", "tire"].some(x => v.includes(x))) return "wash_tires";
   if (["service", "repair", "то", "ремонт"].some(x => v.includes(x))) return "service";
   if (["detailing", "detail", "детейл"].some(x => v.includes(x))) return "detailing";
@@ -107,65 +90,47 @@ async function sendToForumTopic(topicKey, htmlText) {
   });
 }
 
-// =====================================================
-// 1) BOT: только приветствие + картинка + кнопка WebApp
-// =====================================================
+// ===== BOT: только welcome + кнопка =====
 bot.start(async (ctx) => {
   const caption =
     `🚗 <b>FixFast</b>\n` +
-    `Авто-консьерж сервис\n\n` +
+    `Здравствуйте, на связи команда Fix Fast. Мы предоставляем услуги автомобильного консьерж-сервиса и с радостью решим любой вопрос по обслужеванию вашего автомобиля.\n\n` +
     `Оформляйте заявку в мини-приложении.\n` +
     `Нажмите кнопку ниже 👇`;
 
   const keyboard = {
     reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: "🚀 Открыть приложение",
-            web_app: { url: WEBAPP_URL }
-          }
-        ]
-      ]
+      inline_keyboard: [[{ text: "🚀 Открыть приложение", web_app: { url: WEBAPP_URL } }]]
     }
   };
 
-  // Если картинка есть — отправляем фото с подписью
+  console.log("[BOT] /start from", ctx.from?.id);
+
   if (WELCOME_IMAGE_URL) {
     await ctx.replyWithPhoto(
       { url: WELCOME_IMAGE_URL },
       { caption, parse_mode: "HTML", ...keyboard }
     );
-    return;
+  } else {
+    await ctx.reply(caption, { parse_mode: "HTML", ...keyboard });
   }
-
-  // Иначе просто текст
-  await ctx.reply(caption, { parse_mode: "HTML", ...keyboard });
 });
 
-// Всё остальное в чате игнорируем (чтобы не было “ботовых” заявок)
+// чтобы не было “выбери услугу”
 bot.on("message", async (ctx) => {
-  // можешь оставить silent, либо мягко направлять:
-  // await ctx.reply("Нажмите «Открыть приложение» чтобы оставить заявку 👇");
+  // молчим
 });
 
-// =====================================================
-// 2) MINI-APP API: POST /lead -> отправка в топик
-// =====================================================
-// Ожидаемый JSON (пример):
-// {
-//   "service":"bodywork",
-//   "carClass":"Бизнес",
-//   "brandModel":"BMW 5",
-//   "comment":"тест",
-//   "name":"Leo",
-//   "phone":"8985...",
-//   "tgUser": {"id":..., "username":"...", "first_name":"..."}
-// }
+// ===== MINI-APP API =====
+app.get("/lead", (_req, res) => {
+  res.status(200).send("OK. Use POST /lead");
+});
+
 app.post("/lead", async (req, res) => {
   try {
-    const body = req.body || {};
+    console.log("[LEAD] body:", JSON.stringify(req.body || {}));
 
+    const body = req.body || {};
     const serviceKey = normalizeServiceKey(body.service || body.category || body.topic);
     if (!serviceKey || !TOPICS[serviceKey]) {
       return res.status(400).json({ ok: false, error: "Invalid service/topic" });
@@ -178,8 +143,10 @@ app.post("/lead", async (req, res) => {
     const phone = body.phone || body.clientPhone || "";
 
     const tgUser = body.tgUser || body.user || null;
-    const who = tgUser
-      ? `@${escapeHtml(tgUser.username || "")} (${escapeHtml(tgUser.id)})`
+    const who = tgUser?.username
+      ? `@${escapeHtml(tgUser.username)} (${escapeHtml(tgUser.id)})`
+      : tgUser?.id
+      ? `id:${escapeHtml(tgUser.id)}`
       : "WebApp";
 
     const html =
@@ -202,27 +169,36 @@ app.post("/lead", async (req, res) => {
   }
 });
 
-// удобные алиасы (если фронт шлёт на другие пути)
-app.post("/submit", (req, res) => app._router.handle({ ...req, url: "/lead" }, res));
-app.post("/api/lead", (req, res) => app._router.handle({ ...req, url: "/lead" }, res));
-app.post("/api/submit", (req, res) => app._router.handle({ ...req, url: "/lead" }, res));
+// алиасы
+app.post("/submit", (req, res) => {
+  req.url = "/lead";
+  app._router.handle(req, res);
+});
+app.post("/api/lead", (req, res) => {
+  req.url = "/lead";
+  app._router.handle(req, res);
+});
+app.post("/api/submit", (req, res) => {
+  req.url = "/lead";
+  app._router.handle(req, res);
+});
 
-// Webhook endpoint для Telegram
+// webhook callback
 app.use(bot.webhookCallback(WEBHOOK_PATH));
 
 // healthcheck
-app.get("/", (_, res) => res.status(200).send("OK"));
+app.get("/", (_req, res) => res.status(200).send("OK"));
 
-// =====================================================
-// 3) START
-// =====================================================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, async () => {
   try {
     await bot.telegram.setWebhook(WEBHOOK_URL);
     console.log("Server listening on port:", PORT);
-    console.log("Webhook set ✅");
+    console.log("PUBLIC_URL:", PUBLIC_URL);
+    console.log("WEBAPP_URL:", WEBAPP_URL);
+    console.log("WELCOME_IMAGE_URL:", WELCOME_IMAGE_URL ? "set" : "not set");
+    console.log("Webhook set to:", WEBHOOK_URL);
   } catch (e) {
     console.error("Failed to set webhook:", e);
   }
