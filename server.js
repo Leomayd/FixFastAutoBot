@@ -1,6 +1,8 @@
 import express from "express";
 import { Telegraf } from "telegraf";
 
+console.log("SERVER VERSION: 2026-02-11_fixfast_webapp_only");
+
 const BOT_TOKEN = (process.env.BOT_TOKEN || "").trim();
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").trim().replace(/\/$/, "");
 const MANAGER_CHAT_ID = (process.env.MANAGER_CHAT_ID || "").trim();
@@ -21,16 +23,15 @@ if (!WEBAPP_URL) throw new Error("WEBAPP_URL env is required");
 
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
-
 app.use(express.json({ limit: "1mb" }));
 
-// ===== request logging (чтобы поймать мини-апп) =====
+// ---- logs
 app.use((req, _res, next) => {
   console.log(`[HTTP] ${req.method} ${req.url}`);
   next();
 });
 
-// ===== CORS for WebApp =====
+// ---- CORS (для Vercel мини-аппа)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -42,20 +43,21 @@ app.use((req, res, next) => {
 const WEBHOOK_PATH = `/telegraf/${BOT_TOKEN}`;
 const WEBHOOK_URL = `${PUBLIC_URL}${WEBHOOK_PATH}`;
 
+// topic ids (если env пустой — дефолты из твоих сообщений)
 const TOPICS = {
   wash_tires: TOPIC_ID_WASH ? Number(TOPIC_ID_WASH) : 2,
   service: TOPIC_ID_SERVICE ? Number(TOPIC_ID_SERVICE) : 4,
   detailing: TOPIC_ID_DETAILING ? Number(TOPIC_ID_DETAILING) : 6,
   bodywork: TOPIC_ID_BODY ? Number(TOPIC_ID_BODY) : 8,
-  tuning: TOPIC_ID_TUNING ? Number(TOPIC_ID_TUNING) : 10
+  tuning: TOPIC_ID_TUNING ? Number(TOPIC_ID_TUNING) : 10,
 };
 
 const LABELS = {
-  wash_tires: "Мойка / Шиномонтаж",
-  service: "ТО / Ремонт",
+  wash_tires: "Мойка/шиномонтаж",
+  service: "ТО/Ремонт",
   detailing: "Детейлинг",
   bodywork: "Кузовной ремонт",
-  tuning: "Тюнинг"
+  tuning: "Тюнинг",
 };
 
 function escapeHtml(text) {
@@ -65,18 +67,19 @@ function escapeHtml(text) {
     .replaceAll(">", "&gt;");
 }
 
-function normalizeServiceKey(s) {
-  const v = String(s || "").toLowerCase().trim();
-  if (!v) return "";
-  if (TOPICS[v]) return v;
+// твой miniapp отправляет category строкой на русском.
+// маппим в наши ключи топиков:
+function mapCategoryToTopicKey(category) {
+  const c = String(category || "").toLowerCase().trim();
+  if (!c) return "";
 
-  if (["wash", "мойка", "шин", "tire"].some(x => v.includes(x))) return "wash_tires";
-  if (["service", "repair", "то", "ремонт"].some(x => v.includes(x))) return "service";
-  if (["detailing", "detail", "детейл"].some(x => v.includes(x))) return "detailing";
-  if (["body", "bodywork", "кузов"].some(x => v.includes(x))) return "bodywork";
-  if (["tuning", "тюнинг"].some(x => v.includes(x))) return "tuning";
+  if (c.includes("мойка") || c.includes("шином")) return "wash_tires";
+  if (c.includes("то") || c.includes("ремонт")) return "service";
+  if (c.includes("детейл")) return "detailing";
+  if (c.includes("кузов")) return "bodywork";
+  if (c.includes("тюнинг")) return "tuning";
 
-  return v;
+  return "";
 }
 
 async function sendToForumTopic(topicKey, htmlText) {
@@ -86,119 +89,103 @@ async function sendToForumTopic(topicKey, htmlText) {
   return bot.telegram.sendMessage(MANAGER_CHAT_ID, htmlText, {
     parse_mode: "HTML",
     message_thread_id: threadId,
-    disable_web_page_preview: true
+    disable_web_page_preview: true,
   });
 }
 
-// ===== BOT: только welcome + кнопка =====
+// ---------------- BOT: только welcome + кнопка открыть миниапп ----------------
 bot.start(async (ctx) => {
   const caption =
     `🚗 <b>FixFast</b>\n` +
-    `Здравствуйте, на связи команда Fix Fast. Мы предоставляем услуги автомобильного консьерж-сервиса и с радостью решим любой вопрос по обслужеванию вашего автомобиля.\n\n` +
-    `Оформляйте заявку в мини-приложении.\n` +
-    `Нажмите кнопку ниже 👇`;
+    `Авто-консьерж сервис\n\n` +
+    `Оформляйте заявку в мини-приложении 👇`;
 
   const keyboard = {
     reply_markup: {
-      inline_keyboard: [[{ text: "🚀 Открыть приложение", web_app: { url: WEBAPP_URL } }]]
-    }
+      inline_keyboard: [[{ text: "🚀 Открыть приложение", web_app: { url: WEBAPP_URL } }]],
+    },
   };
 
-  console.log("[BOT] /start from", ctx.from?.id);
-
-  if (WELCOME_IMAGE_URL) {
-    await ctx.replyWithPhoto(
-      { url: WELCOME_IMAGE_URL },
-      { caption, parse_mode: "HTML", ...keyboard }
-    );
-  } else {
+  try {
+    if (WELCOME_IMAGE_URL) {
+      await ctx.replyWithPhoto(
+        { url: WELCOME_IMAGE_URL },
+        { caption, parse_mode: "HTML", ...keyboard }
+      );
+    } else {
+      await ctx.reply(caption, { parse_mode: "HTML", ...keyboard });
+    }
+  } catch (e) {
+    console.error("WELCOME SEND ERROR:", e);
+    // запасной вариант, если фото по URL не отдается
     await ctx.reply(caption, { parse_mode: "HTML", ...keyboard });
   }
 });
 
-// чтобы не было “выбери услугу”
-bot.on("message", async (ctx) => {
-  // молчим
-});
+// никаких диалогов в боте
+bot.on("message", async () => {});
 
-// ===== MINI-APP API =====
-app.get("/lead", (_req, res) => {
-  res.status(200).send("OK. Use POST /lead");
-});
+// ---------------- API: то, что дергает miniapp ----------------
 
-app.post("/lead", async (req, res) => {
+// health + версия
+app.get("/", (_req, res) => res.status(200).send("OK"));
+app.get("/api/ping", (_req, res) =>
+  res.json({ ok: true, version: "2026-02-11_fixfast_webapp_only" })
+);
+
+// ТВОЙ ENDPOINT ИЗ МИНИАППА:
+app.post("/api/request", async (req, res) => {
   try {
-    console.log("[LEAD] body:", JSON.stringify(req.body || {}));
-
     const body = req.body || {};
-    const serviceKey = normalizeServiceKey(body.service || body.category || body.topic);
-    if (!serviceKey || !TOPICS[serviceKey]) {
-      return res.status(400).json({ ok: false, error: "Invalid service/topic" });
+    console.log("[API] /api/request body:", JSON.stringify(body));
+
+    const topicKey = mapCategoryToTopicKey(body.category);
+    if (!topicKey) {
+      return res.status(400).json({ ok: false, error: "Unknown category" });
     }
 
-    const carClass = body.carClass || body.class || "";
-    const brandModel = body.brandModel || body.model || body.car || "";
-    const comment = body.comment || body.description || "";
-    const name = body.name || body.clientName || "";
-    const phone = body.phone || body.clientPhone || "";
+    const categoryLabel = escapeHtml(body.category || LABELS[topicKey] || topicKey);
+    const carClass = escapeHtml(body.carClass || "");
+    const carModel = escapeHtml(body.carModel || "");
+    const description = escapeHtml(body.description || "");
 
-    const tgUser = body.tgUser || body.user || null;
+    const tgUser = body.tgUser || null;
     const who = tgUser?.username
       ? `@${escapeHtml(tgUser.username)} (${escapeHtml(tgUser.id)})`
       : tgUser?.id
-      ? `id:${escapeHtml(tgUser.id)}`
+      ? `${escapeHtml(tgUser.id)}`
       : "WebApp";
 
     const html =
       `🆕 <b>Новая заявка</b>\n` +
-      `Категория: <b>${escapeHtml(LABELS[serviceKey] || serviceKey)}</b>\n` +
-      (carClass ? `Класс: <b>${escapeHtml(carClass)}</b>\n` : "") +
-      (brandModel ? `Модель: <b>${escapeHtml(brandModel)}</b>\n` : "") +
-      (comment ? `Описание: ${escapeHtml(comment)}\n` : "") +
-      (name ? `\nИмя: <b>${escapeHtml(name)}</b>` : "") +
-      (phone ? `\nТелефон: <b>${escapeHtml(phone)}</b>` : "") +
-      `\n\nКлиент: ${who}\n` +
-      `Время: ${escapeHtml(new Date().toISOString())}`;
+      `Категория: <b>${categoryLabel}</b>\n` +
+      (carClass ? `Класс: <b>${carClass}</b>\n` : "") +
+      (carModel ? `Модель: <b>${carModel}</b>\n` : "") +
+      (description ? `Описание: ${description}\n` : "") +
+      `\nКлиент: ${who}\n` +
+      `🕒 ${escapeHtml(new Date().toLocaleString("ru-RU"))}`;
 
-    await sendToForumTopic(serviceKey, html);
+    await sendToForumTopic(topicKey, html);
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (e) {
-    console.error("LEAD ERROR:", e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    console.error("API ERROR:", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// алиасы
-app.post("/submit", (req, res) => {
-  req.url = "/lead";
-  app._router.handle(req, res);
-});
-app.post("/api/lead", (req, res) => {
-  req.url = "/lead";
-  app._router.handle(req, res);
-});
-app.post("/api/submit", (req, res) => {
-  req.url = "/lead";
-  app._router.handle(req, res);
-});
-
-// webhook callback
+// ---------------- WEBHOOK ----------------
 app.use(bot.webhookCallback(WEBHOOK_PATH));
-
-// healthcheck
-app.get("/", (_req, res) => res.status(200).send("OK"));
 
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, async () => {
   try {
     await bot.telegram.setWebhook(WEBHOOK_URL);
-    console.log("Server listening on port:", PORT);
-    console.log("PUBLIC_URL:", PUBLIC_URL);
+    console.log("Server listening:", PORT);
+    console.log("Webhook set:", WEBHOOK_URL);
     console.log("WEBAPP_URL:", WEBAPP_URL);
     console.log("WELCOME_IMAGE_URL:", WELCOME_IMAGE_URL ? "set" : "not set");
-    console.log("Webhook set to:", WEBHOOK_URL);
   } catch (e) {
     console.error("Failed to set webhook:", e);
   }
