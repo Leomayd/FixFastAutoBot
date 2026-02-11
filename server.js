@@ -1,50 +1,123 @@
 import express from "express";
 import { Telegraf, Markup } from "telegraf";
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const PUBLIC_URL = process.env.PUBLIC_URL; // например: https://your-service.onrender.com
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // id форум-чата (где топики)
+// ===== ENV (trim!) =====
+const BOT_TOKEN = (process.env.BOT_TOKEN || "").trim();
+const PUBLIC_URL = (process.env.PUBLIC_URL || "").trim(); // важно: без \n
+const MANAGER_CHAT_ID = (process.env.MANAGER_CHAT_ID || "").trim();
+
+// Топики из Render env (как у тебя на скрине)
+const TOPIC_ID_WASH = (process.env.TOPIC_ID_WASH || "").trim();
+const TOPIC_ID_SERVICE = (process.env.TOPIC_ID_SERVICE || "").trim();
+const TOPIC_ID_DETAILING = (process.env.TOPIC_ID_DETAILING || "").trim();
+const TOPIC_ID_BODY = (process.env.TOPIC_ID_BODY || "").trim();
+const TOPIC_ID_TUNING = (process.env.TOPIC_ID_TUNING || "").trim();
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN env is required");
 if (!PUBLIC_URL) throw new Error("PUBLIC_URL env is required");
-if (!ADMIN_CHAT_ID) throw new Error("ADMIN_CHAT_ID env is required");
+if (!MANAGER_CHAT_ID) throw new Error("MANAGER_CHAT_ID env is required");
 
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
+
+// ===== CORS (для Telegram WebApp) =====
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*"); // можно ужесточить позже
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
 const WEBHOOK_PATH = `/telegraf/${BOT_TOKEN}`;
 const WEBHOOK_URL = `${PUBLIC_URL}${WEBHOOK_PATH}`;
 
-// ====== ТВОИ ТОПИКИ (из твоего сообщения) ======
+// ===== TOPICS map =====
 const TOPICS = {
-  wash_tires: 2,     // мойка / шиномонтаж
-  service: 4,        // ТО/Ремонт
-  detailing: 6,      // детейлинг
-  bodywork: 8,       // кузовной ремонт
-  tuning: 10         // тюнинг
+  wash_tires: TOPIC_ID_WASH ? Number(TOPIC_ID_WASH) : 2,
+  service: TOPIC_ID_SERVICE ? Number(TOPIC_ID_SERVICE) : 4,
+  detailing: TOPIC_ID_DETAILING ? Number(TOPIC_ID_DETAILING) : 6,
+  bodywork: TOPIC_ID_BODY ? Number(TOPIC_ID_BODY) : 8,
+  tuning: TOPIC_ID_TUNING ? Number(TOPIC_ID_TUNING) : 10
 };
 
-// ====== УТИЛИТЫ ======
 function escapeHtml(text) {
-  return String(text)
+  return String(text ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+function normalizeServiceKey(s) {
+  const v = String(s || "").toLowerCase().trim();
+  // поддержим разные названия из фронта
+  if (["wash", "wash_tires", "мойка", "шин", "tires"].some(x => v.includes(x))) return "wash_tires";
+  if (["service", "repair", "то", "ремонт"].some(x => v.includes(x))) return "service";
+  if (["detailing", "detail", "детейл"].some(x => v.includes(x))) return "detailing";
+  if (["body", "bodywork", "кузов"].some(x => v.includes(x))) return "bodywork";
+  if (["tuning", "тюнинг"].some(x => v.includes(x))) return "tuning";
+  return v;
 }
 
 async function sendToForumTopic(topicKey, htmlText) {
   const threadId = TOPICS[topicKey];
   if (!threadId) throw new Error(`Unknown topicKey: ${topicKey}`);
 
-  return bot.telegram.sendMessage(ADMIN_CHAT_ID, htmlText, {
+  return bot.telegram.sendMessage(MANAGER_CHAT_ID, htmlText, {
     parse_mode: "HTML",
     message_thread_id: threadId,
     disable_web_page_preview: true
   });
 }
 
-// ====== КНОПКИ ВЫБОРА УСЛУГИ ======
+// ===== MINI-APP API =====
+// Ожидаем JSON примерно такой:
+// { service: "bodywork", carClass, brandModel, comment, name, phone, tgUser }
+async function handleLead(req, res) {
+  try {
+    const body = req.body || {};
+    const serviceKey = normalizeServiceKey(body.service || body.topic || body.type);
+
+    const name = body.name || body.clientName || "";
+    const phone = body.phone || body.clientPhone || "";
+    const comment = body.comment || body.description || "";
+    const carClass = body.carClass || body.class || "";
+    const brandModel = body.brandModel || body.model || body.car || "";
+
+    // tg initData user (если фронт присылает)
+    const tgUser = body.tgUser || body.user || null;
+    const who = tgUser
+      ? `${escapeHtml(tgUser.first_name || "")}${tgUser.last_name ? " " + escapeHtml(tgUser.last_name) : ""}${tgUser.username ? " (@" + escapeHtml(tgUser.username) + ")" : ""}`
+      : "WebApp";
+
+    const html =
+      `🆕 <b>Новая заявка</b>\n` +
+      `🧩 <b>Раздел:</b> ${escapeHtml(serviceKey)}\n` +
+      `👤 ${who}\n` +
+      (carClass ? `🚘 <b>Класс:</b> ${escapeHtml(carClass)}\n` : "") +
+      (brandModel ? `🏷️ <b>Марка/модель:</b> ${escapeHtml(brandModel)}\n` : "") +
+      (name ? `🧾 <b>Имя:</b> ${escapeHtml(name)}\n` : "") +
+      (phone ? `📞 <b>Телефон:</b> ${escapeHtml(phone)}\n` : "") +
+      (comment ? `💬 <b>Комментарий:</b> ${escapeHtml(comment)}\n` : "") +
+      `🕒 ${escapeHtml(new Date().toLocaleString("ru-RU"))}`;
+
+    await sendToForumTopic(serviceKey, html);
+
+    res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error("LEAD ERROR:", e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+}
+
+// несколько путей, чтобы точно совпасть с твоим фронтом
+app.post("/lead", handleLead);
+app.post("/submit", handleLead);
+app.post("/api/lead", handleLead);
+app.post("/api/submit", handleLead);
+
+// ===== BOT FLOW (оставляем) =====
 const serviceKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback("🧼 Мойка / Шиномонтаж", "svc:wash_tires")],
   [Markup.button.callback("🔧 ТО / Ремонт", "svc:service")],
@@ -53,19 +126,16 @@ const serviceKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback("⚙️ Тюнинг", "svc:tuning")]
 ]);
 
-// ====== ПАМЯТЬ ДИАЛОГА (in-memory, для MVP) ======
-const userState = new Map(); // userId -> { step, topicKey, data }
+const userState = new Map();
 
 function setState(userId, patch) {
   const prev = userState.get(userId) || {};
   userState.set(userId, { ...prev, ...patch });
 }
-
 function clearState(userId) {
   userState.delete(userId);
 }
 
-// ====== BOT FLOW ======
 bot.start(async (ctx) => {
   clearState(ctx.from.id);
   await ctx.reply("Выбери услугу, чтобы оставить заявку 👇", serviceKeyboard);
@@ -73,14 +143,11 @@ bot.start(async (ctx) => {
 
 bot.action(/^svc:(.+)$/i, async (ctx) => {
   const topicKey = ctx.match[1];
-
   if (!TOPICS[topicKey]) {
     await ctx.answerCbQuery("Неизвестный раздел");
     return;
   }
-
   setState(ctx.from.id, { step: "name", topicKey, data: {} });
-
   await ctx.answerCbQuery("Ок");
   await ctx.reply("Как вас зовут?");
 });
@@ -108,8 +175,8 @@ bot.on("text", async (ctx) => {
 
   if (st.step === "comment") {
     const data = { ...st.data, comment: text };
-
     const user = ctx.from;
+
     const who =
       `${escapeHtml(user.first_name || "")}` +
       (user.last_name ? ` ${escapeHtml(user.last_name)}` : "") +
@@ -127,7 +194,7 @@ bot.on("text", async (ctx) => {
       await sendToForumTopic(st.topicKey, html);
       await ctx.reply("✅ Заявка отправлена! Скоро с вами свяжутся.");
     } catch (e) {
-      console.error("Failed to send заявку:", e);
+      console.error("Failed to send from bot flow:", e);
       await ctx.reply("❌ Не смог отправить заявку. Попробуй ещё раз или напиши админу.");
     } finally {
       clearState(ctx.from.id);
@@ -135,7 +202,7 @@ bot.on("text", async (ctx) => {
   }
 });
 
-// ====== WEBHOOK ======
+// webhook callback
 app.use(bot.webhookCallback(WEBHOOK_PATH));
 
 // healthcheck
@@ -143,17 +210,12 @@ app.get("/", (_, res) => res.status(200).send("OK"));
 
 const PORT = process.env.PORT || 3000;
 
-async function bootstrap() {
-  // Важно: поднимем вебхук ДО старта сервера — Telegraf норм, но лучше после listen
-  app.listen(PORT, async () => {
-    try {
-      await bot.telegram.setWebhook(WEBHOOK_URL);
-      console.log("Webhook set to:", WEBHOOK_URL);
-      console.log("Server listening on port:", PORT);
-    } catch (e) {
-      console.error("Failed to set webhook:", e);
-    }
-  });
-}
-
-bootstrap();
+app.listen(PORT, async () => {
+  try {
+    await bot.telegram.setWebhook(WEBHOOK_URL);
+    console.log("Webhook set to:", WEBHOOK_URL);
+    console.log("Server listening on port:", PORT);
+  } catch (e) {
+    console.error("Failed to set webhook:", e);
+  }
+});
