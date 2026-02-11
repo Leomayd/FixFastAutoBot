@@ -1,90 +1,139 @@
 import express from "express";
-import fetch from "node-fetch";
+import path from "path";
+import fs from "fs";
+import crypto from "crypto";
 
 const app = express();
-
-// Важно: разрешаем запросы из мини-аппа (браузер внутри Telegram)
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
-});
-
 app.use(express.json());
 
-// === ENV ===
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const MANAGER_CHAT_ID = process.env.MANAGER_CHAT_ID;
-
-function requiredEnv() {
-  if (!BOT_TOKEN) throw new Error("Missing env BOT_TOKEN");
-  if (!MANAGER_CHAT_ID || MANAGER_CHAT_ID === "0") throw new Error("Missing env MANAGER_CHAT_ID");
+// --- helpers ---
+function requiredEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env ${name}`);
+  return v;
 }
 
-async function tgSendMessage(chatId, text) {
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error("Telegram sendMessage failed: " + JSON.stringify(data));
-  }
-  return data;
+const BOT_TOKEN = requiredEnv("BOT_TOKEN");
+const MANAGER_CHAT_ID = requiredEnv("MANAGER_CHAT_ID"); // supergroup id (-100...)
+const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+
+const TOPIC_MAP = [
+  { key: "Мойка/шиномонтаж", env: "TOPIC_ID_WASH" },
+  { key: "ТО/Ремонт", env: "TOPIC_ID_SERVICE" },
+  { key: "Кузовной ремонт", env: "TOPIC_ID_BODY" },
+  { key: "Детейлинг", env: "TOPIC_ID_DETAILING" },
+  { key: "Тюнинг", env: "TOPIC_ID_TUNING" },
+];
+
+function topicIdByCategory(category) {
+  const row = TOPIC_MAP.find((x) => x.key === category);
+  if (!row) return null;
+  const v = process.env[row.env];
+  return v ? Number(v) : null;
 }
 
-function escapeHtml(str) {
-  return String(str)
+function escapeHtml(s = "") {
+  return String(s)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
 }
 
-// healthcheck
-app.get("/", (req, res) => {
-  res.status(200).send("OK");
-});
+async function tgSendMessage({ chat_id, text, message_thread_id }) {
+  const body = { chat_id, text, parse_mode: "HTML" };
+  if (message_thread_id) body.message_thread_id = message_thread_id;
 
-// endpoint called from Mini App
+  const res = await fetch(`${TELEGRAM_API}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.ok === false) {
+    throw new Error(data?.description || "Telegram sendMessage failed");
+  }
+  return data.result;
+}
+
+// --- simple file "db" ---
+const DATA_DIR = path.join(process.cwd(), "data");
+const DB_FILE = path.join(DATA_DIR, "requests.json");
+
+function ensureDb() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify([]), "utf-8");
+}
+ensureDb();
+
+function dbInsert(reqObj) {
+  const arr = JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
+  arr.push(reqObj);
+  fs.writeFileSync(DB_FILE, JSON.stringify(arr, null, 2), "utf-8");
+}
+
+// --- routes ---
+app.get("/", (req, res) => res.send("OK"));
+
 app.post("/api/request", async (req, res) => {
   try {
-    requiredEnv();
+    const { category, carClass, carModel, description, tgUser, initData } = req.body || {};
 
-    const { category, carClass, carModel, description, tgUser } = req.body ?? {};
-    if (!category || !carClass || !carModel || !description) {
-      return res.status(400).json({ ok: false, error: "Missing fields" });
+    if (!category || !carModel || !description) {
+      return res.status(400).json({ ok: false, error: "Missing fields: category, carModel, description" });
     }
 
-    const name = tgUser ? [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" ") : "—";
-    const username = tgUser?.username ? `@${tgUser.username}` : "—";
-    const userId = tgUser?.id ?? "—";
+    const topicId = topicIdByCategory(category);
+    if (!topicId) {
+      return res.status(400).json({ ok: false, error: `Unknown category or topic not configured: ${category}` });
+    }
+
+    const id = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+
+    const userLine = tgUser?.username
+      ? `@${escapeHtml(tgUser.username)}`
+      : tgUser?.first_name
+        ? escapeHtml(tgUser.first_name)
+        : "unknown";
+
+    const userIdLine = tgUser?.id ? ` (${tgUser.id})` : "";
 
     const text =
-`<b>Новая заявка</b>
-<b>Категория:</b> ${escapeHtml(category)}
-<b>Класс:</b> ${escapeHtml(carClass)}
-<b>Марка/модель:</b> ${escapeHtml(carModel)}
-<b>Описание:</b> ${escapeHtml(description)}
+      `🚗 <b>Новая заявка</b>\n` +
+      `Категория: <b>${escapeHtml(category)}</b>\n` +
+      `Класс: <b>${escapeHtml(carClass || "—")}</b>\n` +
+      `Модель: <b>${escapeHtml(carModel)}</b>\n` +
+      `Описание: <b>${escapeHtml(description)}</b>\n\n` +
+      `Клиент: <b>${userLine}</b>${escapeHtml(userIdLine)}\n` +
+      `ID заявки: <code>${id}</code>\n` +
+      `Время: <code>${createdAt}</code>`;
 
-<b>Клиент:</b> ${escapeHtml(name)}
-<b>Username:</b> ${escapeHtml(username)}
-<b>User ID:</b> ${userId}`;
+    // 1) send to managers topic
+    await tgSendMessage({
+      chat_id: MANAGER_CHAT_ID,
+      message_thread_id: topicId,
+      text,
+    });
 
-    await tgSendMessage(MANAGER_CHAT_ID, text);
+    // 2) save to "db"
+    dbInsert({
+      id,
+      createdAt,
+      category,
+      carClass: carClass || "",
+      carModel,
+      description,
+      tgUser: tgUser || null,
+      initData: initData || null,
+    });
 
-    return res.json({ ok: true });
+    return res.json({ ok: true, id });
   } catch (e) {
     console.error("ERR /api/request:", e);
-    return res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: e.message || "Server error" });
   }
 });
 
-// Render сам задаёт PORT
-const port = Number(process.env.PORT || 3000);
-app.listen(port, "0.0.0.0", () => {
-  console.log("Server listening on port", port);
-});
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log("Server listening on port", PORT));
