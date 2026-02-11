@@ -5,7 +5,7 @@ import crypto from "crypto";
 
 const app = express();
 app.use(express.json());
-
+console.log("BOOT: forum-topics version 1");
 // --- helpers ---
 function requiredEnv(name) {
   const v = process.env[name];
