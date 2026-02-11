@@ -4,7 +4,7 @@ import { Telegraf, Markup } from "telegraf";
 // ===== ENV (trim!) =====
 const BOT_TOKEN = (process.env.BOT_TOKEN || "").trim();
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").trim(); // важно: без \n
-const MANAGER_CHAT_ID = (process.env.MANAGER_CHAT_ID || "").trim();
+const ADMIN_CHAT_ID = (process.env.ADMIN_CHAT_ID || "").trim();
 
 // Топики из Render env (как у тебя на скрине)
 const TOPIC_ID_WASH = (process.env.TOPIC_ID_WASH || "").trim();
@@ -15,7 +15,7 @@ const TOPIC_ID_TUNING = (process.env.TOPIC_ID_TUNING || "").trim();
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN env is required");
 if (!PUBLIC_URL) throw new Error("PUBLIC_URL env is required");
-if (!MANAGER_CHAT_ID) throw new Error("MANAGER_CHAT_ID env is required");
+if (!ADMIN_CHAT_ID) throw new Error("ADMIN_CHAT_ID env is required");
 
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
@@ -64,7 +64,7 @@ async function sendToForumTopic(topicKey, htmlText) {
   const threadId = TOPICS[topicKey];
   if (!threadId) throw new Error(`Unknown topicKey: ${topicKey}`);
 
-  return bot.telegram.sendMessage(MANAGER_CHAT_ID, htmlText, {
+  return bot.telegram.sendMessage(ADMIN_CHAT_ID, htmlText, {
     parse_mode: "HTML",
     message_thread_id: threadId,
     disable_web_page_preview: true
