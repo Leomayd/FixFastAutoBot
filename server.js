@@ -1,14 +1,14 @@
 import express from "express";
 import crypto from "crypto";
 import { Telegraf, Markup } from "telegraf";
+import pg from "pg";
 
-console.log("SERVER VERSION: 2026-02-12_fixfast_statuses_v1");
+console.log("SERVER VERSION: 2026-02-12_fixfast_pg_v1");
 
 // =============== ENV ===============
 const BOT_TOKEN = (process.env.BOT_TOKEN || "").trim();
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").trim().replace(/\/$/, "");
 const MANAGER_CHAT_ID = (process.env.MANAGER_CHAT_ID || "").trim();
-
 const WEBAPP_URL = (process.env.WEBAPP_URL || "").trim();
 const WELCOME_IMAGE_URL = (process.env.WELCOME_IMAGE_URL || "").trim();
 
@@ -18,15 +18,18 @@ const TOPIC_ID_DETAILING = (process.env.TOPIC_ID_DETAILING || "").trim();
 const TOPIC_ID_BODY = (process.env.TOPIC_ID_BODY || "").trim();
 const TOPIC_ID_TUNING = (process.env.TOPIC_ID_TUNING || "").trim();
 
+const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
+
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN env is required");
 if (!PUBLIC_URL) throw new Error("PUBLIC_URL env is required");
 if (!MANAGER_CHAT_ID) throw new Error("MANAGER_CHAT_ID env is required");
 if (!WEBAPP_URL) throw new Error("WEBAPP_URL env is required");
+if (!DATABASE_URL) throw new Error("DATABASE_URL env is required");
 
+// =============== APP ===============
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// logs
 app.use((req, _res, next) => {
   console.log(`[HTTP] ${req.method} ${req.url}`);
   next();
@@ -41,6 +44,7 @@ app.use((req, res, next) => {
   next();
 });
 
+// =============== BOT ===============
 const bot = new Telegraf(BOT_TOKEN);
 
 const WEBHOOK_PATH = `/telegraf/${BOT_TOKEN}`;
@@ -63,18 +67,37 @@ const LABELS = {
   tuning: "Тюнинг",
 };
 
-// =============== Memory store (MVP) ===============
-/**
- * request = {
- *  id, userId, categoryKey, categoryLabel,
- *  carClass, carModel, description,
- *  car: { id,title,plate,carClass } | null,
- *  status: "new"|"inwork"|"done"|"canceled",
- *  createdAt, updatedAt
- * }
- */
-const requests = new Map(); // id -> request
-const userIndex = new Map(); // userId -> [requestId]
+// =============== DB ===============
+const { Pool } = pg;
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  // Render Postgres обычно требует ssl
+  ssl: { rejectUnauthorized: false },
+});
+
+async function dbInit() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS requests (
+      id uuid PRIMARY KEY,
+      user_id text NOT NULL,
+      category_key text NOT NULL,
+      category_label text NOT NULL,
+      car_class text NOT NULL,
+      car_model text NOT NULL,
+      description text NOT NULL,
+      car jsonb,
+      status text NOT NULL DEFAULT 'new',
+      client_line text,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_requests_user_id_created_at ON requests (user_id, created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_requests_status ON requests (status);`);
+  console.log("[DB] init ok");
+}
 
 // =============== Utils ===============
 function escapeHtml(text) {
@@ -133,13 +156,6 @@ async function sendToForumTopic(topicKey, htmlText, extraMarkup) {
   });
 }
 
-function upsertUserIndex(userId, requestId) {
-  const key = String(userId);
-  const arr = userIndex.get(key) || [];
-  arr.unshift(requestId);
-  userIndex.set(key, arr);
-}
-
 function safeUserLine(tgUser) {
   if (!tgUser) return "WebApp";
   const username = tgUser.username ? `@${escapeHtml(tgUser.username)}` : "";
@@ -150,16 +166,30 @@ function safeUserLine(tgUser) {
   return "WebApp";
 }
 
-// =============== BOT: /start only (and still respond to /start even if other messages) ===============
+function buildManagerHtml(r) {
+  const car = r.car || null;
+  return (
+    `🧾 <b>Заявка</b> — <b>${escapeHtml(r.category_label)}</b>\n` +
+    `Статус: <b>${escapeHtml(statusLabel(r.status))}</b>\n\n` +
+    (car?.title ? `🚗 <b>Авто:</b> ${escapeHtml(car.title)}\n` : "") +
+    (car?.plate ? `🔢 <b>Номер:</b> ${escapeHtml(car.plate)}\n` : "") +
+    `🚘 <b>Класс:</b> ${escapeHtml(r.car_class)}\n` +
+    `🚗 <b>Модель:</b> ${escapeHtml(r.car_model)}\n` +
+    `📝 <b>Описание:</b> ${escapeHtml(r.description)}\n\n` +
+    `👤 <b>Клиент:</b> ${escapeHtml(r.client_line || "")}\n` +
+    `🆔 <b>ID:</b> <code>${escapeHtml(r.id)}</code>\n` +
+    `🕒 ${escapeHtml(nowRu())}`
+  );
+}
+
+// =============== BOT: /start ===============
 async function sendWelcome(ctx) {
   const caption =
     `🚗 <b>Добрый день, на связи команда Fix Fast.</b>\n` +
     `Мы предоставляем услуги авто-консьерж-сервиса и решим любой вопрос по вашему авто.\n\n` +
     `Оформите заявку в мини-приложении — менеджер возьмёт её в работу 👇`;
 
-  const kb = Markup.inlineKeyboard([
-    [Markup.button.webApp("🚀 Открыть приложение", WEBAPP_URL)],
-  ]);
+  const kb = Markup.inlineKeyboard([[Markup.button.webApp("🚀 Открыть приложение", WEBAPP_URL)]]);
 
   try {
     if (WELCOME_IMAGE_URL) {
@@ -174,11 +204,7 @@ async function sendWelcome(ctx) {
 }
 
 bot.start(sendWelcome);
-
-// на всякий случай: если Telegram пришлет как обычный текст "/start"
 bot.hears(/^\/start$/i, sendWelcome);
-
-// не ломаем остальной чат
 bot.on("message", async () => {});
 
 // manager кнопки статуса
@@ -186,28 +212,28 @@ bot.action(/^req:([a-f0-9-]+):(new|inwork|done|canceled)$/i, async (ctx) => {
   const reqId = ctx.match[1];
   const newStatus = ctx.match[2];
 
-  const r = requests.get(reqId);
+  // обновим в БД и вернем строку
+  const { rows } = await pool.query(
+    `UPDATE requests
+     SET status = $2, updated_at = now()
+     WHERE id = $1
+     RETURNING *;`,
+    [reqId, newStatus]
+  );
+
+  const r = rows[0];
   if (!r) {
     await ctx.answerCbQuery("Заявка не найдена");
     return;
   }
 
-  r.status = newStatus;
-  r.updatedAt = Date.now();
-  requests.set(reqId, r);
+  // jsonb из pg может прийти строкой в некоторых окружениях — подстрахуемся
+  try {
+    if (typeof r.car === "string") r.car = JSON.parse(r.car);
+  } catch {}
 
-  // обновим сообщение менеджерам (попробуем edit)
-  const html =
-    `🧾 <b>Заявка</b> — <b>${escapeHtml(r.categoryLabel)}</b>\n` +
-    `Статус: <b>${escapeHtml(statusLabel(r.status))}</b>\n\n` +
-    (r.car?.title ? `🚗 <b>Авто:</b> ${escapeHtml(r.car.title)}\n` : "") +
-    (r.car?.plate ? `🔢 <b>Номер:</b> ${escapeHtml(r.car.plate)}\n` : "") +
-    `🚘 <b>Класс:</b> ${escapeHtml(r.carClass)}\n` +
-    `🚗 <b>Модель:</b> ${escapeHtml(r.carModel)}\n` +
-    `📝 <b>Описание:</b> ${escapeHtml(r.description)}\n\n` +
-    `👤 <b>Клиент:</b> ${escapeHtml(r.clientLine)}\n` +
-    `🆔 <b>ID:</b> <code>${escapeHtml(r.id)}</code>\n` +
-    `🕒 ${escapeHtml(nowRu())}`;
+  // обновим сообщение менеджерам (edit)
+  const html = buildManagerHtml(r);
 
   try {
     await ctx.editMessageText(html, {
@@ -216,20 +242,17 @@ bot.action(/^req:([a-f0-9-]+):(new|inwork|done|canceled)$/i, async (ctx) => {
       ...managerKeyboard(r.id, r.status),
     });
   } catch (e) {
-    // если не получилось edit (например, старое сообщение) — ничего страшного
     console.warn("editMessageText failed:", e?.message || e);
   }
 
-  // пинганём клиента (если чат с ботом есть)
+  // пинганём клиента
   try {
     await bot.telegram.sendMessage(
-      r.userId,
-      `🔔 Статус вашей заявки обновлён: ${statusLabel(r.status)}\n${r.categoryLabel} • ${r.carModel}`,
+      r.user_id,
+      `🔔 Статус вашей заявки обновлён: ${statusLabel(r.status)}\n${r.category_label} • ${r.car_model}`,
       Markup.inlineKeyboard([[Markup.button.webApp("Открыть приложение", WEBAPP_URL)]])
     );
-  } catch (e) {
-    // если клиент не писал боту — Telegram не даст отправить
-  }
+  } catch {}
 
   await ctx.answerCbQuery(`Статус: ${statusLabel(newStatus)}`);
 });
@@ -241,7 +264,7 @@ bot.action(/^noop:/i, async (ctx) => {
 // =============== API ===============
 // health
 app.get("/", (_req, res) => res.status(200).send("OK"));
-app.get("/api/ping", (_req, res) => res.json({ ok: true, version: "2026-02-12_fixfast_statuses_v1" }));
+app.get("/api/ping", (_req, res) => res.json({ ok: true, version: "2026-02-12_fixfast_pg_v1" }));
 
 // create request (from miniapp)
 app.post("/api/request", async (req, res) => {
@@ -265,37 +288,29 @@ app.post("/api/request", async (req, res) => {
     const car = body.car || null;
 
     const reqId = mkId();
-    const r = {
-      id: reqId,
-      userId,
-      categoryKey: topicKey,
-      categoryLabel: String(categoryLabel),
-      carClass,
-      carModel,
-      description,
-      car,
-      status: "new",
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      clientLine: safeUserLine(tgUser),
-    };
+    const clientLine = safeUserLine(tgUser);
 
-    requests.set(reqId, r);
-    upsertUserIndex(userId, reqId);
+    await pool.query(
+      `INSERT INTO requests
+       (id, user_id, category_key, category_label, car_class, car_model, description, car, status, client_line)
+       VALUES
+       ($1, $2, $3, $4, $5, $6, $7, $8, 'new', $9);`,
+      [reqId, userId, topicKey, String(categoryLabel), carClass, carModel, description, car, clientLine]
+    );
 
     const html =
-      `🧾 <b>Заявка</b> — <b>${escapeHtml(r.categoryLabel)}</b>\n` +
-      `Статус: <b>${escapeHtml(statusLabel(r.status))}</b>\n\n` +
+      `🧾 <b>Заявка</b> — <b>${escapeHtml(String(categoryLabel))}</b>\n` +
+      `Статус: <b>${escapeHtml(statusLabel("new"))}</b>\n\n` +
       (car?.title ? `🚗 <b>Авто:</b> ${escapeHtml(car.title)}\n` : "") +
       (car?.plate ? `🔢 <b>Номер:</b> ${escapeHtml(car.plate)}\n` : "") +
-      `🚘 <b>Класс:</b> ${escapeHtml(r.carClass)}\n` +
-      `🚗 <b>Модель:</b> ${escapeHtml(r.carModel)}\n` +
-      `📝 <b>Описание:</b> ${escapeHtml(r.description)}\n\n` +
-      `👤 <b>Клиент:</b> ${escapeHtml(r.clientLine)}\n` +
-      `🆔 <b>ID:</b> <code>${escapeHtml(r.id)}</code>\n` +
+      `🚘 <b>Класс:</b> ${escapeHtml(carClass)}\n` +
+      `🚗 <b>Модель:</b> ${escapeHtml(carModel)}\n` +
+      `📝 <b>Описание:</b> ${escapeHtml(description)}\n\n` +
+      `👤 <b>Клиент:</b> ${escapeHtml(clientLine)}\n` +
+      `🆔 <b>ID:</b> <code>${escapeHtml(reqId)}</code>\n` +
       `🕒 ${escapeHtml(nowRu())}`;
 
-    await sendToForumTopic(topicKey, html, managerKeyboard(reqId, r.status));
+    await sendToForumTopic(topicKey, html, managerKeyboard(reqId, "new"));
 
     return res.json({ ok: true, id: reqId });
   } catch (e) {
@@ -304,28 +319,32 @@ app.post("/api/request", async (req, res) => {
   }
 });
 
-// list my requests (client side)
+// list my requests
 app.post("/api/my-requests", async (req, res) => {
   try {
     const { tgUser } = req.body || {};
     const userId = tgUser?.id ? String(tgUser.id) : "";
     if (!userId) return res.status(400).json({ ok: false, error: "tgUser.id is required" });
 
-    const ids = userIndex.get(userId) || [];
-    const items = ids
-      .map((id) => requests.get(id))
-      .filter(Boolean)
-      .slice(0, 50)
-      .map((r) => ({
-        id: r.id,
-        category: r.categoryLabel,
-        carClass: r.carClass,
-        carModel: r.carModel,
-        description: r.description,
-        status: r.status,
-        createdAt: r.createdAt,
-        updatedAt: r.updatedAt,
-      }));
+    const { rows } = await pool.query(
+      `SELECT id, category_label, car_class, car_model, description, status, created_at, updated_at
+       FROM requests
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 50;`,
+      [userId]
+    );
+
+    const items = rows.map((r) => ({
+      id: r.id,
+      category: r.category_label,
+      carClass: r.car_class,
+      carModel: r.car_model,
+      description: r.description,
+      status: r.status,
+      createdAt: new Date(r.created_at).getTime(),
+      updatedAt: new Date(r.updated_at).getTime(),
+    }));
 
     return res.json({ ok: true, items });
   } catch (e) {
@@ -334,12 +353,20 @@ app.post("/api/my-requests", async (req, res) => {
   }
 });
 
-// =============== WEBHOOK ROUTE (explicit) ===============
+// webhook
 app.post(WEBHOOK_PATH, bot.webhookCallback(WEBHOOK_PATH));
 
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, async () => {
+  try {
+    await dbInit();
+  } catch (e) {
+    console.error("[DB] init failed:", e);
+    // если БД не поднялась — лучше падать, чем работать без заявок
+    process.exit(1);
+  }
+
   try {
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
     await bot.telegram.setWebhook(WEBHOOK_URL);
@@ -347,6 +374,7 @@ app.listen(PORT, async () => {
   } catch (e) {
     console.error("Webhook setup failed:", e);
   }
+
   console.log("Listening on:", PORT);
   console.log("WEBAPP_URL:", WEBAPP_URL);
 });
