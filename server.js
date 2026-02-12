@@ -3,7 +3,7 @@ import crypto from "crypto";
 import { Telegraf, Markup } from "telegraf";
 import pg from "pg";
 
-console.log("SERVER VERSION: 2026-02-12_fixfast_pg_v4_vin_pexels");
+console.log("SERVER VERSION: 2026-02-12_fixfast_pg_v6_vin_nhtsa_pexels_imgproxy");
 
 // =============== ENV ===============
 const BOT_TOKEN = (process.env.BOT_TOKEN || "").trim();
@@ -20,8 +20,7 @@ const TOPIC_ID_TUNING = (process.env.TOPIC_ID_TUNING || "").trim();
 
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 
-// VIN + Pexels
-const VIN_API_NINJAS_KEY = (process.env.VIN_API_NINJAS_KEY || "").trim();
+// Pexels (для фото)
 const PEXELS_KEY = (process.env.PEXELS_KEY || "").trim();
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN env is required");
@@ -29,6 +28,10 @@ if (!PUBLIC_URL) throw new Error("PUBLIC_URL env is required");
 if (!MANAGER_CHAT_ID) throw new Error("MANAGER_CHAT_ID env is required");
 if (!WEBAPP_URL) throw new Error("WEBAPP_URL env is required");
 if (!DATABASE_URL) throw new Error("DATABASE_URL env is required");
+
+if (!PEXELS_KEY) {
+  console.warn("[WARN] PEXELS_KEY is not configured. Photos will not work.");
+}
 
 // =============== APP ===============
 const app = express();
@@ -105,10 +108,8 @@ async function dbInit() {
     );
   `);
 
-  // new columns
   await pool.query(`ALTER TABLE cars ADD COLUMN IF NOT EXISTS vin text NOT NULL DEFAULT '';`);
   await pool.query(`ALTER TABLE cars ADD COLUMN IF NOT EXISTS color text NOT NULL DEFAULT '';`);
-
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_cars_user_id_created_at ON cars (user_id, created_at DESC);`);
 
   await pool.query(`
@@ -127,7 +128,6 @@ async function dbInit() {
       updated_at timestamptz NOT NULL DEFAULT now()
     );
   `);
-
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_requests_user_id_created_at ON requests (user_id, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_requests_status ON requests (status);`);
 
@@ -144,7 +144,6 @@ async function dbInit() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_bonus_tx_user_id_created_at ON bonus_tx (user_id, created_at DESC);`);
 
-  // car photos
   await pool.query(`
     CREATE TABLE IF NOT EXISTS car_photos (
       id uuid PRIMARY KEY,
@@ -332,33 +331,63 @@ async function awardDoneBonusIfNeeded(reqRow) {
   }
 }
 
-// ===== VIN + Pexels helpers =====
+// ===== VIN (free) via NHTSA vPIC =====
 function isValidVin(vin) {
   return /^[A-HJ-NPR-Z0-9]{17}$/.test(vin);
 }
 
-async function decodeVin(vin) {
-  if (!VIN_API_NINJAS_KEY) throw new Error("VIN_API_NINJAS_KEY not configured");
-  const r = await fetch(`https://api.api-ninjas.com/v1/vinlookup?vin=${encodeURIComponent(vin)}`, {
-    headers: { "X-Api-Key": VIN_API_NINJAS_KEY },
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error("VIN decode failed");
-  return data;
+function normalizeVinDecodedFromNhtsa(result) {
+  // vPIC отдаёт много полей, берём самые полезные
+  const make = (result?.Make || "").trim();
+  const model = (result?.Model || "").trim();
+  const year = (result?.ModelYear || "").toString().trim();
+  const body = (result?.BodyClass || result?.VehicleType || "").trim();
+
+  const errorText = (result?.ErrorText || "").trim();
+  const isBad = !!(errorText && !errorText.toLowerCase().includes("0 -"));
+
+  return {
+    source: "nhtsa",
+    make,
+    model,
+    year,
+    body,
+    errorText,
+    ok: !isBad && !!(make || model || year),
+  };
 }
 
+async function decodeVin(vin) {
+  // бесплатный decode, без ключа
+  const url = `https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValuesExtended/${encodeURIComponent(vin)}?format=json`;
+  const r = await fetch(url);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error("VIN decode failed");
+
+  const first = data?.Results?.[0] || {};
+  const norm = normalizeVinDecodedFromNhtsa(first);
+
+  if (!norm.ok) {
+    // вернём "decoded", но явно пометим ошибку
+    return { ...norm, raw: first };
+  }
+
+  return { ...norm, raw: first };
+}
+
+// ===== Pexels =====
 function buildCarQuery(decoded, color) {
   const year = decoded?.year || "";
   const make = decoded?.make || "";
   const model = decoded?.model || "";
-  const trim = decoded?.trim || decoded?.series || "";
-  const body = decoded?.body_class || decoded?.bodyType || "";
+  const body = decoded?.body || "";
   const c = (color || "").trim();
-  return `${year} ${make} ${model} ${body} ${trim} ${c} car photo`.replace(/\s+/g, " ").trim();
+
+  return `${year} ${make} ${model} ${body} ${c} car`.replace(/\s+/g, " ").trim();
 }
 
 async function pexelsOneImage(query) {
-  if (!PEXELS_KEY) throw new Error("PEXELS_KEY not configured");
+  if (!PEXELS_KEY) return "";
 
   const url = new URL("https://api.pexels.com/v1/search");
   url.searchParams.set("query", query);
@@ -373,10 +402,49 @@ async function pexelsOneImage(query) {
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error("Pexels search failed");
 
-  // Pexels response: photos[0].src.large / original
   const p = data?.photos?.[0];
   return p?.src?.large || p?.src?.original || "";
 }
+
+// ===== IMG PROXY (fix Telegram WebView load failed) =====
+function isAllowedImageUrl(u) {
+  try {
+    const url = new URL(u);
+    if (url.protocol !== "https:") return false;
+    return url.hostname === "images.pexels.com";
+  } catch {
+    return false;
+  }
+}
+
+app.get("/img", async (req, res) => {
+  try {
+    const u = String(req.query?.u || "").trim();
+    if (!u) return res.status(400).send("u required");
+    if (!isAllowedImageUrl(u)) return res.status(400).send("bad url");
+
+    const r = await fetch(u, {
+      headers: {
+        "User-Agent": "FixFastBot/1.0",
+        Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      },
+      redirect: "follow",
+    });
+
+    if (!r.ok) return res.status(502).send("upstream failed");
+
+    const ct = r.headers.get("content-type") || "image/jpeg";
+    const buf = Buffer.from(await r.arrayBuffer());
+
+    res.setHeader("Content-Type", ct);
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    return res.status(200).send(buf);
+  } catch (e) {
+    console.error("GET /img error:", e);
+    return res.status(500).send("proxy error");
+  }
+});
 
 // =============== BOT: /start ===============
 async function sendWelcome(ctx) {
@@ -461,7 +529,7 @@ bot.action(/^noop:/i, async (ctx) => {
 
 // =============== API ===============
 app.get("/", (_req, res) => res.status(200).send("OK"));
-app.get("/api/ping", (_req, res) => res.json({ ok: true, version: "2026-02-12_fixfast_pg_v4_vin_pexels" }));
+app.get("/api/ping", (_req, res) => res.json({ ok: true, version: "2026-02-12_fixfast_pg_v6_vin_nhtsa_pexels_imgproxy" }));
 
 function requireAuth(req, res) {
   const initData = req.body?.initData || "";
@@ -562,7 +630,7 @@ app.post("/api/garage/add", async (req, res) => {
   }
 });
 
-// garage update (plate/vin/color)
+// garage update
 app.post("/api/garage/update", async (req, res) => {
   try {
     const tgUser = requireAuth(req, res);
@@ -656,7 +724,7 @@ app.post("/api/garage/delete", async (req, res) => {
   }
 });
 
-// VIN decode + auto photo (1 img) + save (Pexels)
+// VIN decode + auto photo + save
 app.post("/api/car/vin-auto-photo", async (req, res) => {
   try {
     const tgUser = requireAuth(req, res);
@@ -672,25 +740,32 @@ app.post("/api/car/vin-auto-photo", async (req, res) => {
     if (!vin) return res.status(400).json({ ok: false, error: "vin required" });
     if (!isValidVin(vin)) return res.status(400).json({ ok: false, error: "VIN некорректный (17 символов, без I/O/Q)" });
 
-    const { rows: owned } = await pool.query(`SELECT id FROM cars WHERE id=$1 AND user_id=$2`, [carId, tgUser.id]);
-    if (!owned[0]) return res.status(403).json({ ok: false, error: "forbidden" });
+    const { rows: ownedRows } = await pool.query(`SELECT id, title FROM cars WHERE id=$1 AND user_id=$2`, [carId, tgUser.id]);
+    const owned = ownedRows[0];
+    if (!owned) return res.status(403).json({ ok: false, error: "forbidden" });
 
     const decoded = await decodeVin(vin);
 
-    // 1st attempt: rich query
+    const make = (decoded?.make || "").trim();
+    const model = (decoded?.model || "").trim();
+    const year = (decoded?.year || "").toString().trim();
+    const body = (decoded?.body || "").trim();
+    const decodedPretty = [year, make, model, body].filter(Boolean).join(" ").trim();
+
+    // mismatch предупреждение (если VIN говорит одно, а title другое)
+    const oldTitle = String(owned.title || "").toLowerCase();
+    const mismatch = !!(make && model && !(oldTitle.includes(make.toLowerCase()) || oldTitle.includes(model.toLowerCase())));
+
+    // фото по VIN-данным
     let query = buildCarQuery(decoded, color);
     let url = await pexelsOneImage(query);
 
-    // fallback: simpler query if no result
     if (!url) {
-      const year = decoded?.year || "";
-      const make = decoded?.make || "";
-      const model = decoded?.model || "";
-      const c = (color || "").trim();
-      query = `${year} ${make} ${model} ${c} car photo`.replace(/\s+/g, " ").trim();
+      query = `${year} ${make} ${model} ${color} car`.replace(/\s+/g, " ").trim();
       url = await pexelsOneImage(query);
     }
 
+    // сохраняем VIN + color
     await pool.query(`UPDATE cars SET vin=$2, color=$3, updated_at=now() WHERE id=$1 AND user_id=$4`, [
       carId,
       vin,
@@ -698,13 +773,23 @@ app.post("/api/car/vin-auto-photo", async (req, res) => {
       tgUser.id,
     ]);
 
+    // сохраняем фото
     let photoId = "";
     if (url) {
       photoId = crypto.randomUUID();
       await pool.query(`INSERT INTO car_photos (id, car_id, url, source) VALUES ($1,$2,$3,'pexels')`, [photoId, carId, url]);
     }
 
-    return res.json({ ok: true, decoded, query, photoUrl: url, photoId });
+    return res.json({
+      ok: true,
+      decoded,
+      decodedPretty,
+      mismatch,
+      oldTitle: owned.title,
+      query,
+      photoUrl: url,
+      photoId,
+    });
   } catch (e) {
     console.error("POST /api/car/vin-auto-photo error:", e);
     return res.status(500).json({ ok: false, error: e?.message || "Server error" });
